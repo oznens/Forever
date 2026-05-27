@@ -318,6 +318,7 @@ type Model
     float obLow
     float sl
     box   obBox
+    label obLbl
     label cisdLbl
     line  sweepLine
     label sweepLbl
@@ -335,9 +336,11 @@ var array<Model> models = array.new<Model>()
 drawModel(int dir, float obH, float obL, float sl, float sweepLvl) =>
     m = Model.new(bar = bar_index, dir = dir, obHigh = obH, obLow = obL, sl = sl, invalidated = false, projLines = array.new<line>(), projLbls = array.new<label>())
     if showOB
-        bg = dir == 1 ? color.new(color.teal, 78) : color.new(color.maroon, 78)
+        bg = dir == 1 ? color.new(color.teal, 95) : color.new(color.maroon, 95)
         bd = dir == 1 ? color.new(color.teal, 30) : color.new(color.maroon, 30)
-        m.obBox := box.new(left = bar_index, top = obH, right = bar_index + 15, bottom = obL, bgcolor = bg, border_color = bd)
+        m.obBox := box.new(left = bar_index, top = obH, right = bar_index + 30, bottom = obL, bgcolor = bg, border_color = bd, extend = extend.right)
+        obMidPx = (obH + obL) / 2
+        m.obLbl := label.new(bar_index + 30, obMidPx, text = "-OB", style = label.style_none, textcolor = bd, size = size.small)
     if showCISDLabel
         col = dir == 1 ? color.new(color.green, 0) : color.new(color.red, 0)
         sty = dir == 1 ? label.style_label_up : label.style_label_down
@@ -362,7 +365,8 @@ drawModel(int dir, float obH, float obL, float sl, float sweepLvl) =>
             mult  = array.get(projMults, j)
             level = dir == 1 ? obH + body * mult : obL - body * mult
             pl  = line.new(bar_index + 2, level, bar_index + 22, level, color = color.new(color.red, 0), width = 1, style = line.style_solid)
-            tag = (dir == 1 ? "" : "-") + str.tostring(mult, format.mintick)
+            multTxt = mult == math.round(mult) ? str.tostring(int(mult)) : str.tostring(mult)
+            tag = (dir == 1 ? "" : "-") + multTxt
             pll = label.new(bar_index + 22, level, text = tag, style = label.style_none, textcolor = color.red, size = size.small)
             array.push(m.projLines, pl)
             array.push(m.projLbls, pll)
@@ -375,6 +379,8 @@ drawModel(int dir, float obH, float obL, float sl, float sweepLvl) =>
         old = array.shift(models)
         if not na(old.obBox)
             box.delete(old.obBox)
+        if not na(old.obLbl)
+            label.delete(old.obLbl)
         if not na(old.cisdLbl)
             label.delete(old.cisdLbl)
         if not na(old.sweepLine)
@@ -408,9 +414,6 @@ if array.size(models) > 0
             broken = (mm.dir == 1 and close < mm.obLow) or (mm.dir == -1 and close > mm.obHigh)
             if broken
                 mm.invalidated := true
-                if not na(mm.obBox)
-                    box.set_bgcolor(mm.obBox, color.new(color.gray, 90))
-                    box.set_border_color(mm.obBox, color.new(color.red, 50))
                 if showInvalidation
                     yp = mm.dir == 1 ? low : high
                     mm.invalidLbl := label.new(bar_index, yp, text = "x", style = label.style_label_center, color = color.new(color.red, 0), textcolor = color.white, size = size.small)
