@@ -56,7 +56,8 @@ slBufferTicks  = input.int(2,             "SL buffer (ticks)",   minval=0, group
 
 gSMT = "5. SMT Divergence (optional)"
 useSMT         = input.bool(false,        "Require SMT divergence at sweep",     group = gSMT)
-smtSym         = input.symbol("CAPITALCOM:US100", "Correlated symbol",           group = gSMT)
+useAutoSMT     = input.bool(true,         "Auto-detect correlated symbol",       group = gSMT)
+smtSym         = input.symbol("CAPITALCOM:US100", "Correlated symbol (manual)",  group = gSMT)
 smtInverse     = input.bool(false,        "Inverse correlation",                 group = gSMT)
 
 gSES = "6. Session Filter (killzones)"
@@ -68,8 +69,10 @@ sess4          = input.session("2000-2359", "Session 4 (Asia)",                 
 sessTZ         = input.string("America/New_York", "Session timezone",            group = gSES)
 
 gVIZ = "7. Visuals"
+maxModels      = input.int(40,            "Max model history (formations)", minval=1, maxval=200, group = gVIZ)
+showOutcomes   = input.bool(true,         "Show W/L outcome labels",             group = gVIZ)
 showHTFFVG     = input.bool(true,         "Plot HTF FVG (IRL) zones",            group = gVIZ)
-showLTFFVG     = input.bool(true,         "Plot LTF FVGs",                       group = gVIZ)
+showLTFFVG     = input.bool(false,        "Plot LTF FVGs (context only)",        group = gVIZ)
 showOB         = input.bool(true,         "Plot Orderblock from CISD",           group = gVIZ)
 showSignals    = input.bool(true,         "Plot sweep / CISD markers",           group = gVIZ)
 showTable      = input.bool(true,         "Dashboard table",                     group = gVIZ)
@@ -162,8 +165,34 @@ bearCISD = not na(sweeperBearIdx) and close < open and
 
 // ============================================================================
 //  SMT DIVERGENCE  -  correlated asset failed to make the same sweep
+//      Auto-pair: maps the chart symbol to its common SMT counterpart
+//      (E-mini cross pairs, FX majors, metals, BTC/ETH). Falls back to the
+//      manual symbol when no rule matches.
 // ============================================================================
-[smtH, smtL] = request.security(smtSym, timeframe.period, [high, low],
+autoSmtPair() =>
+    s     = syminfo.ticker
+    base  = syminfo.basecurrency
+    quote = syminfo.currency
+    typ   = syminfo.type
+    fut = s == "ES1!" or str.startswith(s, "ES1") ? "CME_MINI:NQ1!" :
+          s == "NQ1!" or str.startswith(s, "NQ1") ? "CME_MINI:ES1!" :
+          s == "YM1!" ? "CME_MINI:ES1!" :
+          s == "RTY1!" ? "CME_MINI:ES1!" : na
+    fx  = typ == "forex" ?
+          (base == "EUR" and quote == "USD" ? "OANDA:GBPUSD" :
+           base == "GBP" and quote == "USD" ? "OANDA:EURUSD" :
+           base == "AUD" and quote == "USD" ? "OANDA:NZDUSD" :
+           base == "NZD" and quote == "USD" ? "OANDA:AUDUSD" :
+           base == "USD" and quote == "JPY" ? "OANDA:USDCHF" :
+           base == "USD" and quote == "CHF" ? "OANDA:USDJPY" : na) : na
+    met = str.contains(s, "XAU") or str.contains(s, "GOLD")   ? "TVC:SILVER" :
+          str.contains(s, "XAG") or str.contains(s, "SILVER") ? "TVC:GOLD"   : na
+    cry = str.contains(s, "BTC") ? "BINANCE:ETHUSDT" :
+          str.contains(s, "ETH") ? "BINANCE:BTCUSDT" : na
+    not na(fut) ? fut : not na(fx) ? fx : not na(met) ? met : not na(cry) ? cry : smtSym
+
+smtTargetSym = useAutoSMT ? autoSmtPair() : smtSym
+[smtH, smtL] = request.security(smtTargetSym, timeframe.period, [high, low],
      lookahead = barmerge.lookahead_off)
 
 float smtSweeperLow  = na(sweeperBullIdx) ? na : smtL[sweeperBullIdx]
@@ -196,7 +225,7 @@ inSess(s) => not na(time(timeframe.period, s, sessTZ))
 sessionOK = not useSession or inSess(sess1) or inSess(sess2) or inSess(sess3) or inSess(sess4)
 
 // ============================================================================
-//  ENTRY
+//  ENTRY  +  MODEL HISTORY (capped ring of OB boxes)
 // ============================================================================
 htfBullOK = not useHTFBias or htfBias ==  1
 htfBearOK = not useHTFBias or htfBias == -1
@@ -204,36 +233,59 @@ htfBearOK = not useHTFBias or htfBias == -1
 bullSignal = bullCISD and htfBullOK and irlBullActive and smtBullOK and sessionOK and strategy.position_size == 0
 bearSignal = bearCISD and htfBearOK and irlBearActive and smtBearOK and sessionOK and strategy.position_size == 0
 
+var box[] obBoxes = array.new_box()
+
 if bullSignal
     sl   = swBullLow - slBuffer
     risk = close - sl
     if risk > 0
-        obRange = swBullHigh - swBullLow
-        tpERL   = (useERLTarget and not na(lastLTPH) and lastLTPH > close) ? lastLTPH : na
-        tp      = na(tpERL) ? close + risk * rrFallback : tpERL
+        tpERL = (useERLTarget and not na(lastLTPH) and lastLTPH > close) ? lastLTPH : na
+        tp    = na(tpERL) ? close + risk * rrFallback : tpERL
         strategy.entry("L", strategy.long)
         strategy.exit("L-x", "L", stop = sl, limit = tp)
         if showOB
-            box.new(left = bar_index - sweeperBullIdx, top = swBullHigh,
+            b = box.new(left = bar_index - sweeperBullIdx, top = swBullHigh,
                  right = bar_index + 12, bottom = swBullLow,
                  bgcolor = color.new(color.teal, 78), border_color = color.new(color.teal, 40))
-        // reset IRL window after firing
+            array.push(obBoxes, b)
+            while array.size(obBoxes) > maxModels
+                box.delete(array.shift(obBoxes))
         irlBullTagBar := na
 
 if bearSignal
     sl   = swBearHigh + slBuffer
     risk = sl - close
     if risk > 0
-        obRange = swBearHigh - swBearLow
-        tpERL   = (useERLTarget and not na(lastLTPL) and lastLTPL < close) ? lastLTPL : na
-        tp      = na(tpERL) ? close - risk * rrFallback : tpERL
+        tpERL = (useERLTarget and not na(lastLTPL) and lastLTPL < close) ? lastLTPL : na
+        tp    = na(tpERL) ? close - risk * rrFallback : tpERL
         strategy.entry("S", strategy.short)
         strategy.exit("S-x", "S", stop = sl, limit = tp)
         if showOB
-            box.new(left = bar_index - sweeperBearIdx, top = swBearHigh,
+            b = box.new(left = bar_index - sweeperBearIdx, top = swBearHigh,
                  right = bar_index + 12, bottom = swBearLow,
                  bgcolor = color.new(color.maroon, 78), border_color = color.new(color.maroon, 40))
+            array.push(obBoxes, b)
+            while array.size(obBoxes) > maxModels
+                box.delete(array.shift(obBoxes))
         irlBearTagBar := na
+
+// ============================================================================
+//  OUTCOME LABELS  (W / L on every closed trade)
+// ============================================================================
+var int lastClosed = 0
+if showOutcomes and strategy.closedtrades > lastClosed
+    for n = lastClosed to strategy.closedtrades - 1
+        pnl   = strategy.closedtrades.profit(n)
+        win   = pnl > 0
+        exBar = strategy.closedtrades.exit_bar_index(n)
+        exPx  = strategy.closedtrades.exit_price(n)
+        label.new(exBar, exPx,
+             text      = win ? "W" : "L",
+             style     = win ? label.style_label_down : label.style_label_up,
+             color     = win ? color.new(color.green, 0) : color.new(color.red, 0),
+             textcolor = color.white,
+             size      = size.tiny)
+    lastClosed := strategy.closedtrades
 
 // ============================================================================
 //  LTF FVG visuals (for context only — not a trade trigger here)
@@ -278,21 +330,35 @@ alertcondition(bearSignal, "Short Entry",   "Forever-style short fired")
 // ============================================================================
 //  DASHBOARD
 // ============================================================================
-var table info = table.new(position.top_right, 2, 5, border_width = 1)
+var table info = table.new(position.top_right, 2, 7, border_width = 1)
 if showTable and barstate.islast
     biasTxt  = htfBias ==  1 ? "BULL" : htfBias == -1 ? "BEAR" : "—"
     biasCol  = htfBias ==  1 ? color.green : htfBias == -1 ? color.red : color.gray
     irlTxt   = irlBullActive and htfBias == 1 ? "Bull armed" : irlBearActive and htfBias == -1 ? "Bear armed" : "—"
     sessTxt  = useSession ? (sessionOK ? "OPEN" : "closed") : "off"
+    wins     = 0
+    losses   = 0
+    if strategy.closedtrades > 0
+        for n = 0 to strategy.closedtrades - 1
+            if strategy.closedtrades.profit(n) > 0
+                wins   += 1
+            else
+                losses += 1
+    wrTxt = strategy.closedtrades > 0 ? str.tostring(wins) + "W / " + str.tostring(losses) + "L" : "—"
     table.cell(info, 0, 0, "HTF Bias",   bgcolor = color.new(color.black, 70), text_color = color.white)
     table.cell(info, 1, 0, biasTxt,      bgcolor = color.new(biasCol, 70),     text_color = color.white)
     table.cell(info, 0, 1, "IRL",        bgcolor = color.new(color.black, 70), text_color = color.white)
     table.cell(info, 1, 1, irlTxt,       bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 0, 2, "Last STH",   bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 1, 2, na(lastSTH) ? "—" : str.tostring(lastSTH, format.mintick),
+    table.cell(info, 0, 2, "SMT pair",   bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 1, 2, useSMT ? smtTargetSym : "off",
                                          bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 0, 3, "Last STL",   bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 1, 3, na(lastSTL) ? "—" : str.tostring(lastSTL, format.mintick),
+    table.cell(info, 0, 3, "Last STH",   bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 1, 3, na(lastSTH) ? "—" : str.tostring(lastSTH, format.mintick),
                                          bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 0, 4, "Session",    bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 1, 4, sessTxt,      bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 0, 4, "Last STL",   bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 1, 4, na(lastSTL) ? "—" : str.tostring(lastSTL, format.mintick),
+                                         bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 0, 5, "Session",    bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 1, 5, sessTxt,      bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 0, 6, "Trades",     bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 1, 6, wrTxt,        bgcolor = color.new(color.black, 70), text_color = color.white)
