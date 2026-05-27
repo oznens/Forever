@@ -1,20 +1,19 @@
 //@version=6
-// Forever-style SMC Sniper Strategy (v2)
+// Forever-style SMC Sniper Strategy (v4)
 //
-// Implements the publicly described three-part Forever Model workflow:
-//   1. IRL  - Internal Range Liquidity: price tags a Fair Value Gap aligned
-//             with the HTF bias FVG.
-//   2. SMT  - Smart Money Technique: correlation crack against a paired
-//             instrument at the sweep.
-//   3. CISD - Change in State of Delivery: a strong-close candle that
-//             engulfs the body of a previous directional candle which
-//             swept a short-term high or low.
-// On a confirmed CISD the prior swept candle becomes the Orderblock (OB);
-// stop loss sits beyond the OB extreme; take profit targets External
-// Range Liquidity (next major swing) with an OB-multiple fallback.
+// Tightened to match the Forever Model [Pro+] visual workflow:
+//   - 3-state bias (Bullish / Bearish / Both)
+//   - CISD displacement filter to suppress noise
+//   - Only fully-confirmed models draw signal labels
+//   - OB box with N-multiple projection lines ("2", "3" by default)
+//   - ERL horizontal target line with label
+//   - Optional 2nd SMT pair
+//   - Optional invalidation 'x' marker when price breaks the SL extreme
+//   - HTF FVG (IRL) rendered as a single right-extending zone
+//   - No background shading
 //
-// This is an original implementation of the public concept list and is
-// not a reproduction of the proprietary invite-only Pine source.
+// This is an original implementation of the public concept list. It does
+// not include or reproduce the proprietary closed-source Pine.
 
 strategy(
      title              = "Forever-style SMC Sniper",
@@ -37,78 +36,116 @@ strategy(
 //  INPUTS
 // ============================================================================
 gHTF = "1. HTF Bias (IRL source)"
-htf            = input.timeframe("240", "HTF",                                       group = gHTF)
-useHTFBias     = input.bool(true,         "Require HTF bias alignment",              group = gHTF)
-showCE         = input.bool(true,         "Plot CE (FVG midline)",                   group = gHTF)
+biasMode = input.string("Both", "Bias", options = ["Bullish", "Bearish", "Both"], group = gHTF)
+htf      = input.timeframe("D", "HTF for IRL FVG", group = gHTF)
+showCE   = input.bool(true, "Plot CE (FVG midline)", group = gHTF)
 
 gIRL = "2. IRL Tag"
-requireIRLTag  = input.bool(true,         "Require IRL tag (price into HTF FVG)",    group = gIRL)
-maxBarsIRLtoCISD = input.int(40,          "Max bars from IRL tag to CISD",  minval=3, group = gIRL)
+requireIRLTag    = input.bool(true, "Require IRL tag (price into HTF FVG)", group = gIRL)
+maxBarsIRLtoCISD = input.int(40,    "Max bars from IRL tag to CISD", minval = 3, group = gIRL)
 
 gSTR = "3. CISD"
-sthLen         = input.int(3,             "Short-term pivot length (STH/STL)", minval=1, group = gSTR)
-cisdLookback   = input.int(5,             "CISD: bars back to find sweeper",    minval=1, group = gSTR)
+sthLen       = input.int(3,    "Short-term pivot length (STH/STL)", minval = 1, group = gSTR)
+cisdLookback = input.int(5,    "Bars back to find sweeper",         minval = 1, group = gSTR)
+cisdMinDispl = input.float(1.2,"Min CISD body / ATR (displacement)", minval = 0, step = 0.1, group = gSTR)
 
-gERL = "4. ERL / Targets"
-ltLen          = input.int(10,            "Major pivot length (ERL)",   minval=3, group = gERL)
-useERLTarget   = input.bool(true,         "Target next ERL liquidity",          group = gERL)
-rrFallback     = input.float(2.0,         "RR fallback if no ERL ahead", minval=0.5, step=0.25, group = gERL)
-slBufferTicks  = input.int(2,             "SL buffer (ticks)",   minval=0, group = gERL)
+gERL = "4. ERL / OB Projections"
+ltLen          = input.int(10,  "Major pivot length (ERL)", minval = 3, group = gERL)
+useERLTarget   = input.bool(true,  "Target next ERL liquidity",          group = gERL)
+useOBProj      = input.bool(true,  "Show OB projection levels",          group = gERL)
+obProjMults    = input.string("2, 3", "OB projection multipliers (csv)", group = gERL)
+rrFallback     = input.float(2.0, "RR fallback if no ERL ahead", minval = 0.5, step = 0.25, group = gERL)
+slBufferTicks  = input.int(2,   "SL buffer (ticks)", minval = 0, group = gERL)
 
 gSMT = "5. SMT Divergence (optional)"
-useSMT         = input.bool(false,        "Require SMT divergence at sweep",     group = gSMT)
-useAutoSMT     = input.bool(true,         "Auto-detect correlated symbol",       group = gSMT)
-smtSym         = input.symbol("CAPITALCOM:US100", "Correlated symbol (manual)",  group = gSMT)
-smtInverse     = input.bool(false,        "Inverse correlation",                 group = gSMT)
+useSMT      = input.bool(false, "Require SMT divergence at sweep", group = gSMT)
+useAutoSMT  = input.bool(true,  "Auto-detect SMT pair",            group = gSMT)
+smtSym      = input.symbol("BINANCE:ETHUSDT.P", "Manual SMT pair", group = gSMT)
+smtInverse  = input.bool(false, "Inverse correlation",             group = gSMT)
+use2ndSMT   = input.bool(false, "Use 2nd SMT pair",                group = gSMT)
+smtSym2     = input.symbol("CBOT_MINI:YM1!", "2nd SMT pair sym",   group = gSMT)
+smt2Inverse = input.bool(false, "2nd Inverse",                     group = gSMT)
 
 gSES = "6. Session Filter (killzones)"
-useSession     = input.bool(false,        "Trade only inside sessions",          group = gSES)
-sess1          = input.session("0200-0500", "Session 1 (London Open)",           group = gSES)
-sess2          = input.session("0930-1100", "Session 2 (NY AM)",                 group = gSES)
-sess3          = input.session("1330-1600", "Session 3 (NY PM)",                 group = gSES)
-sess4          = input.session("2000-2359", "Session 4 (Asia)",                  group = gSES)
-sessTZ         = input.string("America/New_York", "Session timezone",            group = gSES)
+useSession = input.bool(false, "Trade only inside sessions", group = gSES)
+sess1      = input.session("0200-0500", "Filter 1", group = gSES)
+sess2      = input.session("0800-1200", "Filter 2", group = gSES)
+sess3      = input.session("1330-1615", "Filter 3", group = gSES)
+sess4      = input.session("2000-2300", "Filter 4", group = gSES)
+sessTZ     = input.string("Europe/Berlin", "Timezone", group = gSES)
 
 gVIZ = "7. Visuals"
-maxModels      = input.int(40,            "Max model history (formations)", minval=1, maxval=200, group = gVIZ)
-showOutcomes   = input.bool(true,         "Show W/L outcome labels",             group = gVIZ)
-showHTFFVG     = input.bool(true,         "Plot HTF FVG (IRL) zones",            group = gVIZ)
-showLTFFVG     = input.bool(false,        "Plot LTF FVGs (context only)",        group = gVIZ)
-showOB         = input.bool(true,         "Plot Orderblock from CISD",           group = gVIZ)
-showSignals    = input.bool(true,         "Plot sweep / CISD markers",           group = gVIZ)
-showTable      = input.bool(true,         "Dashboard table",                     group = gVIZ)
+maxModels        = input.int(40,   "Max model history",              minval = 1, maxval = 200, group = gVIZ)
+showOutcomes     = input.bool(true,"Show W/L outcome labels",        group = gVIZ)
+showHTFFVG       = input.bool(true,"Plot HTF FVG (IRL) zones",       group = gVIZ)
+showOB           = input.bool(true,"Plot Orderblock from CISD",      group = gVIZ)
+showERLLine      = input.bool(true,"Plot ERL target line",           group = gVIZ)
+showCISDLabel    = input.bool(true,"Plot CISD label on confirmation",group = gVIZ)
+showInvalidation = input.bool(true,"Plot invalidation 'x' marker",   group = gVIZ)
+showTable        = input.bool(true,"Dashboard table",                group = gVIZ)
 
 slBuffer = slBufferTicks * syminfo.mintick
 
+// Parse projection multipliers "2, 3" -> [2.0, 3.0]
+parseProjMults() =>
+    out = array.new<float>()
+    parts = str.split(obProjMults, ",")
+    if not na(parts)
+        for i = 0 to array.size(parts) - 1
+            raw = str.replace_all(array.get(parts, i), " ", "")
+            v = str.tonumber(raw)
+            if not na(v)
+                array.push(out, v)
+    out
+projMults = parseProjMults()
+
 // ============================================================================
-//  HTF FVG  -> bias + IRL zones
-//      Bullish HTF FVG : low[1]  > high[3]   range = [high[3], low[1]]
-//      Bearish HTF FVG : high[1] < low[3]    range = [high[1], low[3]]
+//  HTF FVG  -> bias + IRL zones (one persistent box per direction)
 // ============================================================================
-[htfH1, htfL1, htfH3, htfL3] = request.security(
-     syminfo.tickerid, htf, [high[1], low[1], high[3], low[3]],
-     lookahead = barmerge.lookahead_off)
+[htfH1, htfL1, htfH3, htfL3] = request.security(syminfo.tickerid, htf, [high[1], low[1], high[3], low[3]], lookahead = barmerge.lookahead_off)
 
 htfBull = htfL1 > htfH3
 htfBear = htfH1 < htfL3
 
-var float htfBullTop = na, var float htfBullBot = na
-var float htfBearTop = na, var float htfBearBot = na
+var float htfBullTop = na
+var float htfBullBot = na
+var float htfBearTop = na
+var float htfBearBot = na
 var int   htfBias    = 0
+var box   htfBullBox = na
+var box   htfBearBox = na
+var line  bullCELine = na
+var line  bearCELine = na
+
 if htfBull
     htfBullTop := htfL1
     htfBullBot := htfH3
     htfBias    := 1
+    if showHTFFVG
+        if not na(htfBullBox)
+            box.delete(htfBullBox)
+        if not na(bullCELine)
+            line.delete(bullCELine)
+        htfBullBox := box.new(left = bar_index - 3, top = htfBullTop, right = bar_index + 5, bottom = htfBullBot, bgcolor = color.new(color.gray, 88), border_color = color.new(color.gray, 70), extend = extend.right)
+        if showCE
+            ce = (htfBullTop + htfBullBot) / 2
+            bullCELine := line.new(bar_index - 3, ce, bar_index + 5, ce, color = color.new(color.gray, 50), style = line.style_dashed, extend = extend.right)
 if htfBear
     htfBearTop := htfL3
     htfBearBot := htfH1
     htfBias    := -1
-
-bullCE = (not na(htfBullTop)) ? (htfBullTop + htfBullBot) / 2 : na
-bearCE = (not na(htfBearTop)) ? (htfBearTop + htfBearBot) / 2 : na
+    if showHTFFVG
+        if not na(htfBearBox)
+            box.delete(htfBearBox)
+        if not na(bearCELine)
+            line.delete(bearCELine)
+        htfBearBox := box.new(left = bar_index - 3, top = htfBearTop, right = bar_index + 5, bottom = htfBearBot, bgcolor = color.new(color.gray, 88), border_color = color.new(color.gray, 70), extend = extend.right)
+        if showCE
+            ce = (htfBearTop + htfBearBot) / 2
+            bearCELine := line.new(bar_index - 3, ce, bar_index + 5, ce, color = color.new(color.gray, 50), style = line.style_dashed, extend = extend.right)
 
 // ============================================================================
-//  IRL TAG  -> price wicks into the latest HTF FVG of the active bias
+//  IRL TAG
 // ============================================================================
 irlBullTag = htfBias ==  1 and not na(htfBullTop) and low  <= htfBullTop and low  >= htfBullBot
 irlBearTag = htfBias == -1 and not na(htfBearBot) and high >= htfBearBot and high <= htfBearTop
@@ -124,19 +161,23 @@ irlBullActive = not requireIRLTag or (not na(irlBullTagBar) and bar_index - irlB
 irlBearActive = not requireIRLTag or (not na(irlBearTagBar) and bar_index - irlBearTagBar <= maxBarsIRLtoCISD)
 
 // ============================================================================
-//  SHORT-TERM HIGH / LOW for sweep
+//  STH / STL pivots = liquidity pools
 // ============================================================================
 sth = ta.pivothigh(high, sthLen, sthLen)
 stl = ta.pivotlow(low,  sthLen, sthLen)
-var float lastSTH = na, var float lastSTL = na
+var float lastSTH = na
+var float lastSTL = na
 if not na(sth)
     lastSTH := sth
 if not na(stl)
     lastSTL := stl
 
 // ============================================================================
-//  CISD  -  strong close engulfing body of previous candle that swept STH/STL
+//  CISD with displacement filter
 // ============================================================================
+atrV = ta.atr(20)
+displOK = math.abs(close - open) >= cisdMinDispl * atrV
+
 int sweeperBullIdx = na
 int sweeperBearIdx = na
 if not na(lastSTL)
@@ -152,21 +193,16 @@ float swBullOpen  = na(sweeperBullIdx) ? na : open[sweeperBullIdx]
 float swBullClose = na(sweeperBullIdx) ? na : close[sweeperBullIdx]
 float swBullHigh  = na(sweeperBullIdx) ? na : high[sweeperBullIdx]
 float swBullLow   = na(sweeperBullIdx) ? na : low[sweeperBullIdx]
-
 float swBearOpen  = na(sweeperBearIdx) ? na : open[sweeperBearIdx]
 float swBearClose = na(sweeperBearIdx) ? na : close[sweeperBearIdx]
 float swBearHigh  = na(sweeperBearIdx) ? na : high[sweeperBearIdx]
 float swBearLow   = na(sweeperBearIdx) ? na : low[sweeperBearIdx]
 
-// Bullish CISD: current bar green, close engulfs the sweeper's body upward
-bullCISD = not na(sweeperBullIdx) and close > open and close > math.max(swBullOpen, swBullClose)
-bearCISD = not na(sweeperBearIdx) and close < open and close < math.min(swBearOpen, swBearClose)
+bullCISD = not na(sweeperBullIdx) and close > open and close > math.max(swBullOpen, swBullClose) and displOK
+bearCISD = not na(sweeperBearIdx) and close < open and close < math.min(swBearOpen, swBearClose) and displOK
 
 // ============================================================================
-//  SMT DIVERGENCE  -  correlated asset failed to make the same sweep
-//      Auto-pair: maps the chart symbol to its common SMT counterpart
-//      (E-mini cross pairs, FX majors, metals, BTC/ETH). Falls back to the
-//      manual symbol when no rule matches.
+//  SMT  (1st + optional 2nd pair)
 // ============================================================================
 autoSmtPair() =>
     s     = syminfo.ticker
@@ -197,33 +233,44 @@ autoSmtPair() =>
     else if str.contains(s, "XAG") or str.contains(s, "SILVER")
         result := "TVC:GOLD"
     else if str.contains(s, "BTC")
-        result := "BINANCE:ETHUSDT"
+        result := "BINANCE:ETHUSDT.P"
     else if str.contains(s, "ETH")
-        result := "BINANCE:BTCUSDT"
+        result := "BINANCE:BTCUSDT.P"
     result
 
-smtTargetSym = useAutoSMT ? autoSmtPair() : smtSym
-[smtH, smtL] = request.security(smtTargetSym, timeframe.period, [high, low],
-     lookahead = barmerge.lookahead_off)
+smtTargetSym  = useAutoSMT ? autoSmtPair() : smtSym
+[smtH,  smtL]  = request.security(smtTargetSym, timeframe.period, [high, low], lookahead = barmerge.lookahead_off)
+[smtH2, smtL2] = request.security(smtSym2,      timeframe.period, [high, low], lookahead = barmerge.lookahead_off)
 
-float smtSweeperLow  = na(sweeperBullIdx) ? na : smtL[sweeperBullIdx]
-float smtSweeperHigh = na(sweeperBearIdx) ? na : smtH[sweeperBearIdx]
-float smtPriorLow    = na(sweeperBullIdx) ? na : smtL[sweeperBullIdx + 1]
-float smtPriorHigh   = na(sweeperBearIdx) ? na : smtH[sweeperBearIdx + 1]
+float smtSweepLo  = na(sweeperBullIdx) ? na : smtL[sweeperBullIdx]
+float smtSweepHi  = na(sweeperBearIdx) ? na : smtH[sweeperBearIdx]
+float smtPriorLo  = na(sweeperBullIdx) ? na : smtL[sweeperBullIdx + 1]
+float smtPriorHi  = na(sweeperBearIdx) ? na : smtH[sweeperBearIdx + 1]
+float smt2SweepLo = na(sweeperBullIdx) ? na : smtL2[sweeperBullIdx]
+float smt2SweepHi = na(sweeperBearIdx) ? na : smtH2[sweeperBearIdx]
+float smt2PriorLo = na(sweeperBullIdx) ? na : smtL2[sweeperBullIdx + 1]
+float smt2PriorHi = na(sweeperBearIdx) ? na : smtH2[sweeperBearIdx + 1]
 
-// our chart made a lower low; correlated did NOT (direct correlation)
-smtBullDirect = not na(smtSweeperLow)  and not na(smtPriorLow)  and smtSweeperLow  >= smtPriorLow
-smtBearDirect = not na(smtSweeperHigh) and not na(smtPriorHigh) and smtSweeperHigh <= smtPriorHigh
-// inverse correlation flips the test
-smtBullOK = not useSMT or (smtInverse ? not smtBullDirect : smtBullDirect)
-smtBearOK = not useSMT or (smtInverse ? not smtBearDirect : smtBearDirect)
+smtBullDirect  = not na(smtSweepLo)  and not na(smtPriorLo)  and smtSweepLo  >= smtPriorLo
+smtBearDirect  = not na(smtSweepHi)  and not na(smtPriorHi)  and smtSweepHi  <= smtPriorHi
+smt2BullDirect = not na(smt2SweepLo) and not na(smt2PriorLo) and smt2SweepLo >= smt2PriorLo
+smt2BearDirect = not na(smt2SweepHi) and not na(smt2PriorHi) and smt2SweepHi <= smt2PriorHi
+
+smt1BullOK = smtInverse  ? not smtBullDirect  : smtBullDirect
+smt1BearOK = smtInverse  ? not smtBearDirect  : smtBearDirect
+smt2BullOK = smt2Inverse ? not smt2BullDirect : smt2BullDirect
+smt2BearOK = smt2Inverse ? not smt2BearDirect : smt2BearDirect
+
+smtBullOK = not useSMT or (use2ndSMT ? (smt1BullOK or smt2BullOK) : smt1BullOK)
+smtBearOK = not useSMT or (use2ndSMT ? (smt1BearOK or smt2BearOK) : smt1BearOK)
 
 // ============================================================================
-//  ERL  -  next major swing in trade direction (TP target)
+//  ERL  -  next major swing liquidity
 // ============================================================================
 ltPH = ta.pivothigh(high, ltLen, ltLen)
 ltPL = ta.pivotlow(low,  ltLen, ltLen)
-var float lastLTPH = na, var float lastLTPL = na
+var float lastLTPH = na
+var float lastLTPL = na
 if not na(ltPH)
     lastLTPH := ltPH
 if not na(ltPL)
@@ -236,16 +283,104 @@ inSess(s) => not na(time(timeframe.period, s, sessTZ))
 sessionOK = not useSession or inSess(sess1) or inSess(sess2) or inSess(sess3) or inSess(sess4)
 
 // ============================================================================
-//  ENTRY  +  MODEL HISTORY (capped ring of OB boxes)
+//  BIAS gate
+//      "Both"     -> require HTF bias to match signal direction
+//      "Bullish"  -> only long signals, HTF bias not required
+//      "Bearish"  -> only short signals, HTF bias not required
 // ============================================================================
-htfBullOK = not useHTFBias or htfBias ==  1
-htfBearOK = not useHTFBias or htfBias == -1
+bullDirOK = biasMode == "Bullish" or (biasMode == "Both" and htfBias ==  1)
+bearDirOK = biasMode == "Bearish" or (biasMode == "Both" and htfBias == -1)
 
-bullSignal = bullCISD and htfBullOK and irlBullActive and smtBullOK and sessionOK and strategy.position_size == 0
-bearSignal = bearCISD and htfBearOK and irlBearActive and smtBearOK and sessionOK and strategy.position_size == 0
+bullSignal = bullCISD and bullDirOK and irlBullActive and smtBullOK and sessionOK and strategy.position_size == 0
+bearSignal = bearCISD and bearDirOK and irlBearActive and smtBearOK and sessionOK and strategy.position_size == 0
 
-var array<box> obBoxes = array.new<box>()
+// ============================================================================
+//  MODEL drawing  -  OB box + projection lines + ERL line + CISD label
+//      Tracked per-direction so we can mark invalidation later.
+//      Ring buffer evicts the oldest formation past maxModels.
+// ============================================================================
+type Model
+    int   bar
+    int   dir
+    float obHigh
+    float obLow
+    float sl
+    box   obBox
+    label cisdLbl
+    line  erlLine
+    label erlLbl
+    array<line>  projLines
+    array<label> projLbls
+    bool  invalidated
+    label invalidLbl
 
+var array<Model> models = array.new<Model>()
+
+drawModel(int dir, int swIdx, float obH, float obL, float sl) =>
+    m = Model.new(bar = bar_index, dir = dir, obHigh = obH, obLow = obL, sl = sl, invalidated = false, projLines = array.new<line>(), projLbls = array.new<label>())
+    if showOB
+        bg = dir == 1 ? color.new(color.teal, 78) : color.new(color.maroon, 78)
+        bd = dir == 1 ? color.new(color.teal, 30) : color.new(color.maroon, 30)
+        m.obBox := box.new(left = bar_index - swIdx, top = obH, right = bar_index + 15, bottom = obL, bgcolor = bg, border_color = bd)
+    if showCISDLabel
+        col = dir == 1 ? color.new(color.green, 0) : color.new(color.red, 0)
+        sty = dir == 1 ? label.style_label_up : label.style_label_down
+        ypx = dir == 1 ? low : high
+        m.cisdLbl := label.new(bar_index, ypx, text = "CISD", style = sty, color = col, textcolor = color.white, size = size.small)
+    body = obH - obL
+    if useOBProj and body > 0 and array.size(projMults) > 0
+        for j = 0 to array.size(projMults) - 1
+            mult  = array.get(projMults, j)
+            level = dir == 1 ? obH + body * mult : obL - body * mult
+            pl = line.new(bar_index + 2, level, bar_index + 22, level, color = color.new(color.red, 0), width = 1, style = line.style_solid)
+            tag = (dir == 1 ? "" : "-") + str.tostring(mult, format.mintick)
+            pll = label.new(bar_index + 22, level, text = tag, style = label.style_none, textcolor = color.red, size = size.small)
+            array.push(m.projLines, pl)
+            array.push(m.projLbls, pll)
+    erlPx = dir == 1 ? lastLTPH : lastLTPL
+    if showERLLine and not na(erlPx) and ((dir == 1 and erlPx > obH) or (dir == -1 and erlPx < obL))
+        m.erlLine := line.new(bar_index, erlPx, bar_index + 30, erlPx, color = color.new(color.black, 0), width = 1, extend = extend.right)
+        m.erlLbl  := label.new(bar_index + 30, erlPx, text = "ERL", style = label.style_none, textcolor = color.new(color.black, 0), size = size.small)
+    array.push(models, m)
+    while array.size(models) > maxModels
+        old = array.shift(models)
+        if not na(old.obBox)
+            box.delete(old.obBox)
+        if not na(old.cisdLbl)
+            label.delete(old.cisdLbl)
+        if not na(old.erlLine)
+            line.delete(old.erlLine)
+        if not na(old.erlLbl)
+            label.delete(old.erlLbl)
+        if not na(old.invalidLbl)
+            label.delete(old.invalidLbl)
+        if array.size(old.projLines) > 0
+            for k = 0 to array.size(old.projLines) - 1
+                line.delete(array.get(old.projLines, k))
+        if array.size(old.projLbls) > 0
+            for k = 0 to array.size(old.projLbls) - 1
+                label.delete(array.get(old.projLbls, k))
+
+// ============================================================================
+//  INVALIDATION  -  mark active models whose SL got hit
+// ============================================================================
+if array.size(models) > 0
+    for j = 0 to array.size(models) - 1
+        mm = array.get(models, j)
+        if not mm.invalidated
+            broken = (mm.dir == 1 and low < mm.sl) or (mm.dir == -1 and high > mm.sl)
+            if broken
+                mm.invalidated := true
+                if not na(mm.obBox)
+                    box.set_bgcolor(mm.obBox, color.new(color.gray, 90))
+                    box.set_border_color(mm.obBox, color.new(color.red, 50))
+                if showInvalidation
+                    yp = mm.dir == 1 ? low : high
+                    mm.invalidLbl := label.new(bar_index, yp, text = "x", style = label.style_label_center, color = color.new(color.red, 0), textcolor = color.white, size = size.small)
+
+// ============================================================================
+//  ENTRY orders
+// ============================================================================
 if bullSignal
     sl   = swBullLow - slBuffer
     risk = close - sl
@@ -254,13 +389,7 @@ if bullSignal
         tp    = na(tpERL) ? close + risk * rrFallback : tpERL
         strategy.entry("L", strategy.long)
         strategy.exit("L-x", "L", stop = sl, limit = tp)
-        if showOB
-            b = box.new(left = bar_index - sweeperBullIdx, top = swBullHigh,
-                 right = bar_index + 12, bottom = swBullLow,
-                 bgcolor = color.new(color.teal, 78), border_color = color.new(color.teal, 40))
-            array.push(obBoxes, b)
-            while array.size(obBoxes) > maxModels
-                box.delete(array.shift(obBoxes))
+        drawModel(1, sweeperBullIdx, swBullHigh, swBullLow, sl)
         irlBullTagBar := na
 
 if bearSignal
@@ -271,13 +400,7 @@ if bearSignal
         tp    = na(tpERL) ? close - risk * rrFallback : tpERL
         strategy.entry("S", strategy.short)
         strategy.exit("S-x", "S", stop = sl, limit = tp)
-        if showOB
-            b = box.new(left = bar_index - sweeperBearIdx, top = swBearHigh,
-                 right = bar_index + 12, bottom = swBearLow,
-                 bgcolor = color.new(color.maroon, 78), border_color = color.new(color.maroon, 40))
-            array.push(obBoxes, b)
-            while array.size(obBoxes) > maxModels
-                box.delete(array.shift(obBoxes))
+        drawModel(-1, sweeperBearIdx, swBearHigh, swBearLow, sl)
         irlBearTagBar := na
 
 // ============================================================================
@@ -290,62 +413,21 @@ if showOutcomes and strategy.closedtrades > lastClosed
         win   = pnl > 0
         exBar = strategy.closedtrades.exit_bar_index(n)
         exPx  = strategy.closedtrades.exit_price(n)
-        label.new(exBar, exPx,
-             text      = win ? "W" : "L",
-             style     = win ? label.style_label_down : label.style_label_up,
-             color     = win ? color.new(color.green, 0) : color.new(color.red, 0),
-             textcolor = color.white,
-             size      = size.tiny)
+        label.new(exBar, exPx, text = win ? "W" : "L", style = win ? label.style_label_down : label.style_label_up, color = win ? color.new(color.green, 0) : color.new(color.red, 0), textcolor = color.white, size = size.tiny)
     lastClosed := strategy.closedtrades
-
-// ============================================================================
-//  LTF FVG visuals (for context only — not a trade trigger here)
-// ============================================================================
-ltfBullFVG = low > high[2]
-ltfBearFVG = high < low[2]
-if showLTFFVG and ltfBullFVG
-    box.new(left = bar_index - 2, top = low, right = bar_index + 6, bottom = high[2],
-         bgcolor = color.new(color.green, 86), border_color = color.new(color.green, 60))
-if showLTFFVG and ltfBearFVG
-    box.new(left = bar_index - 2, top = low[2], right = bar_index + 6, bottom = high,
-         bgcolor = color.new(color.red, 86), border_color = color.new(color.red, 60))
-
-// ============================================================================
-//  HTF FVG / CE / signal markers
-// ============================================================================
-plot(showHTFFVG and not na(htfBullTop) ? htfBullTop : na, "HTF Bull FVG top", color.new(color.green, 30), style = plot.style_linebr)
-plot(showHTFFVG and not na(htfBullBot) ? htfBullBot : na, "HTF Bull FVG bot", color.new(color.green, 30), style = plot.style_linebr)
-plot(showHTFFVG and not na(htfBearTop) ? htfBearTop : na, "HTF Bear FVG top", color.new(color.red,   30), style = plot.style_linebr)
-plot(showHTFFVG and not na(htfBearBot) ? htfBearBot : na, "HTF Bear FVG bot", color.new(color.red,   30), style = plot.style_linebr)
-plot(showCE and not na(bullCE) ? bullCE : na, "Bull CE", color.new(color.green, 50), style = plot.style_circles)
-plot(showCE and not na(bearCE) ? bearCE : na, "Bear CE", color.new(color.red,   50), style = plot.style_circles)
-
-plotshape(showSignals and irlBullTag, "IRL Bull Tag", shape.diamond,   location.belowbar, color.new(color.lime,   0), size = size.tiny)
-plotshape(showSignals and irlBearTag, "IRL Bear Tag", shape.diamond,   location.abovebar, color.new(color.fuchsia,0), size = size.tiny)
-plotshape(showSignals and bullCISD,   "Bull CISD",    shape.labelup,   location.belowbar, color.new(color.green,  0), text = "CISD", textcolor = color.white, size = size.tiny)
-plotshape(showSignals and bearCISD,   "Bear CISD",    shape.labeldown, location.abovebar, color.new(color.red,    0), text = "CISD", textcolor = color.white, size = size.tiny)
-
-biasBg = htfBias == 1 ? color.new(color.green, 95) : htfBias == -1 ? color.new(color.red, 95) : na
-bgcolor(biasBg, title = "HTF Bias")
 
 // ============================================================================
 //  ALERTS
 // ============================================================================
-alertcondition(irlBullTag, "IRL Bull Tag",  "Price tagged bullish HTF FVG (IRL)")
-alertcondition(irlBearTag, "IRL Bear Tag",  "Price tagged bearish HTF FVG (IRL)")
-alertcondition(bullCISD,   "Bull CISD",     "Bullish CISD confirmed")
-alertcondition(bearCISD,   "Bear CISD",     "Bearish CISD confirmed")
-alertcondition(bullSignal, "Long Entry",    "Forever-style long fired")
-alertcondition(bearSignal, "Short Entry",   "Forever-style short fired")
+alertcondition(bullSignal, "Forever Long",  "Forever-style long fired")
+alertcondition(bearSignal, "Forever Short", "Forever-style short fired")
 
 // ============================================================================
 //  DASHBOARD
 // ============================================================================
-var table info = table.new(position.top_right, 2, 7, border_width = 1)
+var table info = table.new(position.top_right, 2, 6, border_width = 1)
 if showTable and barstate.islast
-    biasTxt  = htfBias ==  1 ? "BULL" : htfBias == -1 ? "BEAR" : "—"
-    biasCol  = htfBias ==  1 ? color.green : htfBias == -1 ? color.red : color.gray
-    irlTxt   = irlBullActive and htfBias == 1 ? "Bull armed" : irlBearActive and htfBias == -1 ? "Bear armed" : "—"
+    biasTxt  = biasMode + (htfBias == 1 ? " | HTF BULL" : htfBias == -1 ? " | HTF BEAR" : " | HTF —")
     sessTxt  = useSession ? (sessionOK ? "OPEN" : "closed") : "off"
     wins     = 0
     losses   = 0
@@ -356,20 +438,15 @@ if showTable and barstate.islast
             else
                 losses += 1
     wrTxt = strategy.closedtrades > 0 ? str.tostring(wins) + "W / " + str.tostring(losses) + "L" : "—"
-    table.cell(info, 0, 0, "HTF Bias",   bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 1, 0, biasTxt,      bgcolor = color.new(biasCol, 70),     text_color = color.white)
-    table.cell(info, 0, 1, "IRL",        bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 1, 1, irlTxt,       bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 0, 2, "SMT pair",   bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 1, 2, useSMT ? smtTargetSym : "off",
-                                         bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 0, 3, "Last STH",   bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 1, 3, na(lastSTH) ? "—" : str.tostring(lastSTH, format.mintick),
-                                         bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 0, 4, "Last STL",   bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 1, 4, na(lastSTL) ? "—" : str.tostring(lastSTL, format.mintick),
-                                         bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 0, 5, "Session",    bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 1, 5, sessTxt,      bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 0, 6, "Trades",     bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 1, 6, wrTxt,        bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 0, 0, "Bias",      bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 1, 0, biasTxt,     bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 0, 1, "TF align",  bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 1, 1, htf,         bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 0, 2, "SMT pair",  bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 1, 2, useSMT ? (use2ndSMT ? smtTargetSym + " + " + smtSym2 : smtTargetSym) : "off", bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 0, 3, "Session",   bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 1, 3, sessTxt,     bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 0, 4, "Models",    bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 1, 4, str.tostring(array.size(models)), bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 0, 5, "Trades",    bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 1, 5, wrTxt,       bgcolor = color.new(color.black, 70), text_color = color.white)
