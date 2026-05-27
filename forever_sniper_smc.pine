@@ -56,6 +56,7 @@ ltLen          = input.int(10,  "Major pivot length (ERL)",      minval = 3, gro
 useERLTarget   = input.bool(true,  "Target next ERL liquidity",           group = gERL)
 useOBProj      = input.bool(true,  "Show OB projection levels",           group = gERL)
 obProjMults    = input.string("2, 3", "OB projection multipliers (csv)",  group = gERL)
+entryThreshold = input.string("Continuation", "Entry Zone Threshold", options = ["Deep Retracement", "Continuation"], group = gERL)
 rrFallback     = input.float(2.0, "RR fallback if no ERL ahead", minval = 0.5, step = 0.25, group = gERL)
 slBufferTicks  = input.int(2,   "SL buffer (ticks)", minval = 0, group = gERL)
 
@@ -304,8 +305,16 @@ sessionOK = not useSession or inSess(sess1) or inSess(sess2) or inSess(sess3) or
 bullDirOK = (biasMode == "Bullish") or (biasMode == "Neutral" and htfBias ==  1)
 bearDirOK = (biasMode == "Bearish") or (biasMode == "Neutral" and htfBias == -1)
 
-bullSignal = bullCISD and bullDirOK and irlBullActive and smtBullOK and sessionOK and strategy.position_size == 0
-bearSignal = bearCISD and bearDirOK and irlBearActive and smtBearOK and sessionOK and strategy.position_size == 0
+// Entry Zone Threshold:
+//   Continuation     -> setup is valid anywhere in the dealing range
+//   Deep Retracement -> bull setup must form below range midpoint;
+//                       bear setup must form above range midpoint
+rangeMid   = (not na(lastLTPH) and not na(lastLTPL)) ? (lastLTPH + lastLTPL) / 2 : na
+deepBullOK = entryThreshold == "Continuation" or na(rangeMid) or close <= rangeMid
+deepBearOK = entryThreshold == "Continuation" or na(rangeMid) or close >= rangeMid
+
+bullSignal = bullCISD and bullDirOK and irlBullActive and smtBullOK and sessionOK and deepBullOK and strategy.position_size == 0
+bearSignal = bearCISD and bearDirOK and irlBearActive and smtBearOK and sessionOK and deepBearOK and strategy.position_size == 0
 
 // ============================================================================
 //  MODEL drawing  -  OB box (the CISD candle itself) + projections + ERL +
@@ -414,9 +423,48 @@ if array.size(models) > 0
             broken = (mm.dir == 1 and close < mm.obLow) or (mm.dir == -1 and close > mm.obHigh)
             if broken
                 mm.invalidated := true
+                // Forever spec: on invalidation, the full model components
+                // are removed; only a small marker remains. Delete every
+                // drawing handle except invalidLbl.
+                if not na(mm.obBox)
+                    box.delete(mm.obBox)
+                    mm.obBox := na
+                if not na(mm.obLbl)
+                    label.delete(mm.obLbl)
+                    mm.obLbl := na
+                if not na(mm.cisdLbl)
+                    label.delete(mm.cisdLbl)
+                    mm.cisdLbl := na
+                if not na(mm.sweepLine)
+                    line.delete(mm.sweepLine)
+                    mm.sweepLine := na
+                if not na(mm.sweepLbl)
+                    label.delete(mm.sweepLbl)
+                    mm.sweepLbl := na
+                if not na(mm.smtLine)
+                    line.delete(mm.smtLine)
+                    mm.smtLine := na
+                if not na(mm.smtLbl)
+                    label.delete(mm.smtLbl)
+                    mm.smtLbl := na
+                if not na(mm.erlLine)
+                    line.delete(mm.erlLine)
+                    mm.erlLine := na
+                if not na(mm.erlLbl)
+                    label.delete(mm.erlLbl)
+                    mm.erlLbl := na
+                if array.size(mm.projLines) > 0
+                    for k = 0 to array.size(mm.projLines) - 1
+                        line.delete(array.get(mm.projLines, k))
+                    array.clear(mm.projLines)
+                if array.size(mm.projLbls) > 0
+                    for k = 0 to array.size(mm.projLbls) - 1
+                        label.delete(array.get(mm.projLbls, k))
+                    array.clear(mm.projLbls)
                 if showInvalidation
                     yp = mm.dir == 1 ? low : high
-                    mm.invalidLbl := label.new(bar_index, yp, text = "x", style = label.style_label_center, color = color.new(color.red, 0), textcolor = color.white, size = size.small)
+                    invCol = mm.dir == 1 ? color.new(color.green, 40) : color.new(color.red, 40)
+                    mm.invalidLbl := label.new(bar_index, yp, text = "", style = label.style_xcross, color = invCol, size = size.tiny)
 
 // ============================================================================
 //  ENTRY orders
