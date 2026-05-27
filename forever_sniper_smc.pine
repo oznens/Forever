@@ -83,6 +83,7 @@ showHTFFVG       = input.bool(true,"Plot HTF FVG (IRL) zones",       group = gVI
 showOB           = input.bool(true,"Plot Orderblock from CISD",      group = gVIZ)
 showERLLine      = input.bool(true,"Plot ERL target line",           group = gVIZ)
 showSweep        = input.bool(true,"Plot sweep marker",              group = gVIZ)
+showSMTLine      = input.bool(true,"Plot SMT divergence line",       group = gVIZ)
 showCISDLabel    = input.bool(true,"Plot CISD label on confirmation",group = gVIZ)
 showInvalidation = input.bool(true,"Plot invalidation 'x' marker",   group = gVIZ)
 showTable        = input.bool(true,"Dashboard table",                group = gVIZ)
@@ -168,12 +169,16 @@ irlBearActive = not requireIRLTag or (not na(irlBearTagBar) and bar_index - irlB
 // ============================================================================
 sth = ta.pivothigh(high, sthLen, sthLen)
 stl = ta.pivotlow(low,  sthLen, sthLen)
-var float lastSTH = na
-var float lastSTL = na
+var float lastSTH    = na
+var float lastSTL    = na
+var int   lastSTHBar = na
+var int   lastSTLBar = na
 if not na(sth)
-    lastSTH := sth
+    lastSTH    := sth
+    lastSTHBar := bar_index - sthLen
 if not na(stl)
-    lastSTL := stl
+    lastSTL    := stl
+    lastSTLBar := bar_index - sthLen
 
 // ============================================================================
 //  CISD  -  Forever's definition:
@@ -304,6 +309,8 @@ type Model
     label cisdLbl
     line  sweepLine
     label sweepLbl
+    line  smtLine
+    label smtLbl
     line  erlLine
     label erlLbl
     array<line>  projLines
@@ -327,6 +334,15 @@ drawModel(int dir, float obH, float obL, float sl, float sweepLvl) =>
     if showSweep and not na(sweepLvl)
         m.sweepLine := line.new(bar_index - 4, sweepLvl, bar_index + 2, sweepLvl, color = color.new(color.orange, 0), style = line.style_dotted, width = 1)
         m.sweepLbl  := label.new(bar_index + 2, sweepLvl, text = "✕", style = label.style_none, textcolor = color.new(color.orange, 0), size = size.tiny)
+    if showSMTLine
+        fromBar = dir == 1 ? lastSTLBar : lastSTHBar
+        if not na(fromBar) and fromBar < bar_index
+            fromPx = sweepLvl
+            toPx   = dir == 1 ? low : high
+            m.smtLine := line.new(fromBar, fromPx, bar_index, toPx, color = color.new(color.black, 30), width = 1)
+            midBar = math.round((fromBar + bar_index) / 2)
+            midPx  = (fromPx + toPx) / 2
+            m.smtLbl  := label.new(midBar, midPx, text = useAutoSMT ? smtTargetSym : smtSym, style = label.style_none, textcolor = color.new(color.black, 30), size = size.tiny)
     body = obH - obL
     if useOBProj and body > 0 and array.size(projMults) > 0
         for j = 0 to array.size(projMults) - 1
@@ -352,6 +368,10 @@ drawModel(int dir, float obH, float obL, float sl, float sweepLvl) =>
             line.delete(old.sweepLine)
         if not na(old.sweepLbl)
             label.delete(old.sweepLbl)
+        if not na(old.smtLine)
+            line.delete(old.smtLine)
+        if not na(old.smtLbl)
+            label.delete(old.smtLbl)
         if not na(old.erlLine)
             line.delete(old.erlLine)
         if not na(old.erlLbl)
