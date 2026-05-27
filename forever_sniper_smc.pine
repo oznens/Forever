@@ -270,12 +270,24 @@ smtBearOK = not useSMT or (use2ndSMT ? (smt1BearOK or smt2BearOK) : smt1BearOK)
 // ============================================================================
 ltPH = ta.pivothigh(high, ltLen, ltLen)
 ltPL = ta.pivotlow(low,  ltLen, ltLen)
-var float lastLTPH = na
-var float lastLTPL = na
+var float lastLTPH    = na
+var float lastLTPL    = na
+var int   lastLTPHBar = na
+var int   lastLTPLBar = na
+var float prevLTPH    = na
+var float prevLTPL    = na
+var int   prevLTPHBar = na
+var int   prevLTPLBar = na
 if not na(ltPH)
-    lastLTPH := ltPH
+    prevLTPH    := lastLTPH
+    prevLTPHBar := lastLTPHBar
+    lastLTPH    := ltPH
+    lastLTPHBar := bar_index - ltLen
 if not na(ltPL)
-    lastLTPL := ltPL
+    prevLTPL    := lastLTPL
+    prevLTPLBar := lastLTPLBar
+    lastLTPL    := ltPL
+    lastLTPLBar := bar_index - ltLen
 
 // ============================================================================
 //  SESSION FILTER
@@ -335,12 +347,13 @@ drawModel(int dir, float obH, float obL, float sl, float sweepLvl) =>
         m.sweepLine := line.new(bar_index - 4, sweepLvl, bar_index + 2, sweepLvl, color = color.new(color.orange, 0), style = line.style_dotted, width = 1)
         m.sweepLbl  := label.new(bar_index + 2, sweepLvl, text = "✕", style = label.style_none, textcolor = color.new(color.orange, 0), size = size.tiny)
     if showSMTLine
-        fromBar = dir == 1 ? lastSTLBar : lastSTHBar
-        if not na(fromBar) and fromBar < bar_index
-            fromPx = sweepLvl
-            toPx   = dir == 1 ? low : high
-            m.smtLine := line.new(fromBar, fromPx, bar_index, toPx, color = color.new(color.black, 30), width = 1)
-            midBar = math.round((fromBar + bar_index) / 2)
+        fromBar = dir == 1 ? prevLTPLBar : prevLTPHBar
+        toBar   = dir == 1 ? lastLTPLBar : lastLTPHBar
+        fromPx  = dir == 1 ? prevLTPL    : prevLTPH
+        toPx    = dir == 1 ? lastLTPL    : lastLTPH
+        if not na(fromBar) and not na(toBar) and fromBar < toBar
+            m.smtLine := line.new(fromBar, fromPx, toBar, toPx, color = color.new(color.black, 30), width = 1)
+            midBar = math.round((fromBar + toBar) / 2)
             midPx  = (fromPx + toPx) / 2
             m.smtLbl  := label.new(midBar, midPx, text = useAutoSMT ? smtTargetSym : smtSym, style = label.style_none, textcolor = color.new(color.black, 30), size = size.tiny)
     body = obH - obL
