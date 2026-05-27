@@ -1,15 +1,20 @@
 //@version=5
-// Forever-style SMC Sniper Strategy
-// Inspired by the public SMC/ICT workflow:
-//   1. HTF bias from the latest Higher-Timeframe Fair Value Gap
-//   2. Liquidity sweep of a swing pivot on the trading TF
-//   3. Market Structure Shift (CHoCH) in the opposite direction
-//   4. Entry on the first Fair Value Gap that forms inside the CHoCH leg
-//   5. Stop beyond the swept liquidity, target at an R-multiple
-//   6. Optional SMT divergence filter against a correlated symbol
+// Forever-style SMC Sniper Strategy (v2)
 //
-// This is an original implementation of the published SMC concepts; it is not
-// a reproduction of any proprietary closed-source indicator.
+// Implements the publicly described three-part Forever Model workflow:
+//   1. IRL  - Internal Range Liquidity: price tags a Fair Value Gap aligned
+//             with the HTF bias FVG.
+//   2. SMT  - Smart Money Technique: correlation crack against a paired
+//             instrument at the sweep.
+//   3. CISD - Change in State of Delivery: a strong-close candle that
+//             engulfs the body of a previous directional candle which
+//             swept a short-term high or low.
+// On a confirmed CISD the prior swept candle becomes the Orderblock (OB);
+// stop loss sits beyond the OB extreme; take profit targets External
+// Range Liquidity (next major swing) with an OB-multiple fallback.
+//
+// This is an original implementation of the public concept list and is
+// not a reproduction of the proprietary invite-only Pine source.
 
 strategy(
      title              = "Forever-style SMC Sniper",
@@ -30,247 +35,264 @@ strategy(
 // ============================================================================
 //  INPUTS
 // ============================================================================
-gHTF   = "Higher Timeframe Bias"
-htf            = input.timeframe("240", "HTF",                                      group = gHTF)
-useHTFBias     = input.bool(true,        "Require HTF FVG bias alignment",          group = gHTF)
+gHTF = "1. HTF Bias (IRL source)"
+htf            = input.timeframe("240", "HTF",                                       group = gHTF)
+useHTFBias     = input.bool(true,         "Require HTF bias alignment",              group = gHTF)
+showCE         = input.bool(true,         "Plot CE (FVG midline)",                   group = gHTF)
 
-gStruct = "Structure / Sweep"
-swingLen       = input.int(5,            "Swing pivot length (liquidity)",  minval=2, group = gStruct)
-maxBarsToCHoCH = input.int(30,           "Max bars from sweep to CHoCH",    minval=2, group = gStruct)
-maxBarsToEntry = input.int(25,           "Max bars from CHoCH to entry",    minval=2, group = gStruct)
+gIRL = "2. IRL Tag"
+requireIRLTag  = input.bool(true,         "Require IRL tag (price into HTF FVG)",    group = gIRL)
+maxBarsIRLtoCISD = input.int(40,          "Max bars from IRL tag to CISD",  minval=3, group = gIRL)
 
-gRisk = "Risk Management"
-rr             = input.float(2.0,        "Risk : Reward target",            minval=0.5, step=0.25, group = gRisk)
-slBufferTicks  = input.int(2,            "SL buffer (ticks beyond sweep)",  minval=0, group = gRisk)
+gSTR = "3. CISD"
+sthLen         = input.int(3,             "Short-term pivot length (STH/STL)", minval=1, group = gSTR)
+cisdLookback   = input.int(5,             "CISD: bars back to find sweeper",    minval=1, group = gSTR)
 
-gSMT = "SMT Divergence (optional)"
-useSMT         = input.bool(false,       "Use SMT divergence filter",               group = gSMT)
-smtSym         = input.symbol("CAPITALCOM:US100", "Correlated symbol",              group = gSMT)
+gERL = "4. ERL / Targets"
+ltLen          = input.int(10,            "Major pivot length (ERL)",   minval=3, group = gERL)
+useERLTarget   = input.bool(true,         "Target next ERL liquidity",          group = gERL)
+rrFallback     = input.float(2.0,         "RR fallback if no ERL ahead", minval=0.5, step=0.25, group = gERL)
+slBufferTicks  = input.int(2,             "SL buffer (ticks)",   minval=0, group = gERL)
 
-gViz = "Visuals"
-showFVG        = input.bool(true,        "Plot LTF Fair Value Gaps",                group = gViz)
-showHTFZone    = input.bool(true,        "Highlight HTF bias on background",        group = gViz)
-showSignals    = input.bool(true,        "Plot sweep / CHoCH markers",              group = gViz)
+gSMT = "5. SMT Divergence (optional)"
+useSMT         = input.bool(false,        "Require SMT divergence at sweep",     group = gSMT)
+smtSym         = input.symbol("CAPITALCOM:US100", "Correlated symbol",           group = gSMT)
+smtInverse     = input.bool(false,        "Inverse correlation",                 group = gSMT)
+
+gSES = "6. Session Filter (killzones)"
+useSession     = input.bool(false,        "Trade only inside sessions",          group = gSES)
+sess1          = input.session("0200-0500", "Session 1 (London Open)",           group = gSES)
+sess2          = input.session("0930-1100", "Session 2 (NY AM)",                 group = gSES)
+sess3          = input.session("1330-1600", "Session 3 (NY PM)",                 group = gSES)
+sess4          = input.session("2000-2359", "Session 4 (Asia)",                  group = gSES)
+sessTZ         = input.string("America/New_York", "Session timezone",            group = gSES)
+
+gVIZ = "7. Visuals"
+showHTFFVG     = input.bool(true,         "Plot HTF FVG (IRL) zones",            group = gVIZ)
+showLTFFVG     = input.bool(true,         "Plot LTF FVGs",                       group = gVIZ)
+showOB         = input.bool(true,         "Plot Orderblock from CISD",           group = gVIZ)
+showSignals    = input.bool(true,         "Plot sweep / CISD markers",           group = gVIZ)
+showTable      = input.bool(true,         "Dashboard table",                     group = gVIZ)
 
 slBuffer = slBufferTicks * syminfo.mintick
 
 // ============================================================================
-//  HTF FAIR VALUE GAP -> BIAS
-//      Bullish HTF FVG : low[1]  > high[3]
-//      Bearish HTF FVG : high[1] < low[3]
+//  HTF FVG  -> bias + IRL zones
+//      Bullish HTF FVG : low[1]  > high[3]   range = [high[3], low[1]]
+//      Bearish HTF FVG : high[1] < low[3]    range = [high[1], low[3]]
 // ============================================================================
 [htfH1, htfL1, htfH3, htfL3] = request.security(
      syminfo.tickerid, htf, [high[1], low[1], high[3], low[3]],
      lookahead = barmerge.lookahead_off)
 
-htfBullFVG = htfL1 > htfH3
-htfBearFVG = htfH1 < htfL3
+htfBull = htfL1 > htfH3
+htfBear = htfH1 < htfL3
 
-var int htfBias = 0
-if htfBullFVG
-    htfBias := 1
-if htfBearFVG
-    htfBias := -1
+var float htfBullTop = na, var float htfBullBot = na
+var float htfBearTop = na, var float htfBearBot = na
+var int   htfBias    = 0
+if htfBull
+    htfBullTop := htfL1
+    htfBullBot := htfH3
+    htfBias    := 1
+if htfBear
+    htfBearTop := htfL3
+    htfBearBot := htfH1
+    htfBias    := -1
 
-// ============================================================================
-//  SWING PIVOTS = LIQUIDITY POOLS
-// ============================================================================
-ph = ta.pivothigh(high, swingLen, swingLen)
-pl = ta.pivotlow(low,  swingLen, swingLen)
-
-var float lastPH = na
-var float lastPL = na
-if not na(ph)
-    lastPH := ph
-if not na(pl)
-    lastPL := pl
+bullCE = (not na(htfBullTop)) ? (htfBullTop + htfBullBot) / 2 : na
+bearCE = (not na(htfBearTop)) ? (htfBearTop + htfBearBot) / 2 : na
 
 // ============================================================================
-//  LIQUIDITY SWEEP
-//      Bullish setup : wick takes lastPL, body closes back above
-//      Bearish setup : wick takes lastPH, body closes back below
+//  IRL TAG  -> price wicks into the latest HTF FVG of the active bias
 // ============================================================================
-sweepLow  = not na(lastPL) and low  < lastPL and close > lastPL
-sweepHigh = not na(lastPH) and high > lastPH and close < lastPH
+irlBullTag = htfBias ==  1 and not na(htfBullTop) and low  <= htfBullTop and low  >= htfBullBot
+irlBearTag = htfBias == -1 and not na(htfBearBot) and high >= htfBearBot and high <= htfBearTop
 
-// ============================================================================
-//  CHoCH / MSS  state machine
-// ============================================================================
-var int   sweepDir     = 0          // +1 bull setup pending, -1 bear setup pending
-var int   sweepBar     = na
-var float sweepExtreme = na         // wick low (bull) / wick high (bear)
+var int irlBullTagBar = na
+var int irlBearTagBar = na
+if irlBullTag
+    irlBullTagBar := bar_index
+if irlBearTag
+    irlBearTagBar := bar_index
 
-if sweepLow
-    sweepDir     := 1
-    sweepBar     := bar_index
-    sweepExtreme := low
-if sweepHigh
-    sweepDir     := -1
-    sweepBar     := bar_index
-    sweepExtreme := high
-
-// time-out the pending sweep if no CHoCH within window
-if sweepDir != 0 and bar_index - sweepBar > maxBarsToCHoCH
-    sweepDir := 0
-
-// Use a 1-bar minor pivot as the level whose break = CHoCH
-minorPH = ta.pivothigh(high, 1, 1)
-minorPL = ta.pivotlow(low,  1, 1)
-
-var float bullCHoCHLvl = na
-var float bearCHoCHLvl = na
-
-if sweepDir == 1 and not na(minorPH)
-    bullCHoCHLvl := minorPH
-if sweepDir == -1 and not na(minorPL)
-    bearCHoCHLvl := minorPL
-
-bullCHoCH = sweepDir == 1 and not na(bullCHoCHLvl) and close > bullCHoCHLvl
-bearCHoCH = sweepDir == -1 and not na(bearCHoCHLvl) and close < bearCHoCHLvl
+irlBullActive = not requireIRLTag or (not na(irlBullTagBar) and bar_index - irlBullTagBar <= maxBarsIRLtoCISD)
+irlBearActive = not requireIRLTag or (not na(irlBearTagBar) and bar_index - irlBearTagBar <= maxBarsIRLtoCISD)
 
 // ============================================================================
-//  LTF FAIR VALUE GAPS (entry zones)
+//  SHORT-TERM HIGH / LOW for sweep
 // ============================================================================
-bullFVG    = low > high[2]
-bearFVG    = high < low[2]
-bullFVGTop = low
-bullFVGBot = high[2]
-bearFVGTop = low[2]
-bearFVGBot = high
+sth = ta.pivothigh(high, sthLen, sthLen)
+stl = ta.pivotlow(low,  sthLen, sthLen)
+var float lastSTH = na, var float lastSTL = na
+if not na(sth)
+    lastSTH := sth
+if not na(stl)
+    lastSTL := stl
 
 // ============================================================================
-//  ENTRY ZONE state machine
+//  CISD  -  strong close engulfing body of previous candle that swept STH/STL
 // ============================================================================
-var int   setupDir = 0
-var int   chochBar = na
-var float entryTop = na
-var float entryBot = na
-var float entrySL  = na
+int sweeperBullIdx = na
+int sweeperBearIdx = na
+if not na(lastSTL)
+    for i = 1 to cisdLookback
+        if low[i] < lastSTL and na(sweeperBullIdx)
+            sweeperBullIdx := i
+if not na(lastSTH)
+    for i = 1 to cisdLookback
+        if high[i] > lastSTH and na(sweeperBearIdx)
+            sweeperBearIdx := i
 
-if bullCHoCH
-    setupDir       := 1
-    chochBar       := bar_index
-    entryTop       := na
-    entryBot       := na
-    entrySL        := sweepExtreme - slBuffer
-    sweepDir       := 0
-    bullCHoCHLvl   := na
-if bearCHoCH
-    setupDir       := -1
-    chochBar       := bar_index
-    entryTop       := na
-    entryBot       := na
-    entrySL        := sweepExtreme + slBuffer
-    sweepDir       := 0
-    bearCHoCHLvl   := na
+float swBullOpen  = na(sweeperBullIdx) ? na : open[sweeperBullIdx]
+float swBullClose = na(sweeperBullIdx) ? na : close[sweeperBullIdx]
+float swBullHigh  = na(sweeperBullIdx) ? na : high[sweeperBullIdx]
+float swBullLow   = na(sweeperBullIdx) ? na : low[sweeperBullIdx]
 
-// capture the first FVG inside the CHoCH leg, in the setup direction
-if setupDir == 1 and bullFVG and na(entryTop)
-    entryTop := bullFVGTop
-    entryBot := bullFVGBot
-if setupDir == -1 and bearFVG and na(entryTop)
-    entryTop := bearFVGTop
-    entryBot := bearFVGBot
+float swBearOpen  = na(sweeperBearIdx) ? na : open[sweeperBearIdx]
+float swBearClose = na(sweeperBearIdx) ? na : close[sweeperBearIdx]
+float swBearHigh  = na(sweeperBearIdx) ? na : high[sweeperBearIdx]
+float swBearLow   = na(sweeperBearIdx) ? na : low[sweeperBearIdx]
 
-// abandon setup if no fill within window
-if setupDir != 0 and bar_index - chochBar > maxBarsToEntry and strategy.position_size == 0
-    setupDir := 0
-    entryTop := na
-    entryBot := na
-    entrySL  := na
+// Bullish CISD: current bar green, close engulfs the sweeper's body upward
+bullCISD = not na(sweeperBullIdx) and close > open and
+           close > math.max(swBullOpen, swBullClose)
+bearCISD = not na(sweeperBearIdx) and close < open and
+           close < math.min(swBearOpen, swBearClose)
 
 // ============================================================================
-//  SMT DIVERGENCE FILTER  (optional)
-//      We sweep a low; correlated asset DOES NOT sweep its low  -> bullish SMT
-//      We sweep a high; correlated asset DOES NOT sweep its high -> bearish SMT
+//  SMT DIVERGENCE  -  correlated asset failed to make the same sweep
 // ============================================================================
-[smtH, smtL] = request.security(
-     smtSym, timeframe.period, [high, low],
+[smtH, smtL] = request.security(smtSym, timeframe.period, [high, low],
      lookahead = barmerge.lookahead_off)
 
-var float smtPriorL = na
-var float smtPriorH = na
-if not na(pl)
-    smtPriorL := smtL
-if not na(ph)
-    smtPriorH := smtH
+float smtSweeperLow  = na(sweeperBullIdx) ? na : smtL[sweeperBullIdx]
+float smtSweeperHigh = na(sweeperBearIdx) ? na : smtH[sweeperBearIdx]
+float smtPriorLow    = na(sweeperBullIdx) ? na : smtL[sweeperBullIdx + 1]
+float smtPriorHigh   = na(sweeperBearIdx) ? na : smtH[sweeperBearIdx + 1]
 
-smtBull = not useSMT or (sweepLow  and not na(smtPriorL) and smtL >= smtPriorL)
-smtBear = not useSMT or (sweepHigh and not na(smtPriorH) and smtH <= smtPriorH)
-
-var bool smtOkBull = not useSMT
-var bool smtOkBear = not useSMT
-if sweepLow
-    smtOkBull := smtBull
-if sweepHigh
-    smtOkBear := smtBear
+// our chart made a lower low; correlated did NOT (direct correlation)
+smtBullDirect = not na(smtSweeperLow)  and not na(smtPriorLow)  and smtSweeperLow  >= smtPriorLow
+smtBearDirect = not na(smtSweeperHigh) and not na(smtPriorHigh) and smtSweeperHigh <= smtPriorHigh
+// inverse correlation flips the test
+smtBullOK = not useSMT or (smtInverse ? not smtBullDirect : smtBullDirect)
+smtBearOK = not useSMT or (smtInverse ? not smtBearDirect : smtBearDirect)
 
 // ============================================================================
-//  ENTRIES
+//  ERL  -  next major swing in trade direction (TP target)
 // ============================================================================
-htfOkBull = not useHTFBias or htfBias ==  1
-htfOkBear = not useHTFBias or htfBias == -1
+ltPH = ta.pivothigh(high, ltLen, ltLen)
+ltPL = ta.pivotlow(low,  ltLen, ltLen)
+var float lastLTPH = na, var float lastLTPL = na
+if not na(ltPH)
+    lastLTPH := ltPH
+if not na(ltPL)
+    lastLTPL := ltPL
 
-longTouch  = setupDir ==  1 and not na(entryTop) and low  <= entryTop
-shortTouch = setupDir == -1 and not na(entryBot) and high >= entryBot
+// ============================================================================
+//  SESSION FILTER
+// ============================================================================
+inSess(s) => not na(time(timeframe.period, s, sessTZ))
+sessionOK = not useSession or inSess(sess1) or inSess(sess2) or inSess(sess3) or inSess(sess4)
 
-longSignal  = longTouch  and htfOkBull and smtOkBull and strategy.position_size == 0
-shortSignal = shortTouch and htfOkBear and smtOkBear and strategy.position_size == 0
+// ============================================================================
+//  ENTRY
+// ============================================================================
+htfBullOK = not useHTFBias or htfBias ==  1
+htfBearOK = not useHTFBias or htfBias == -1
 
-if longSignal
-    fill = close
-    risk = fill - entrySL
+bullSignal = bullCISD and htfBullOK and irlBullActive and smtBullOK and sessionOK and strategy.position_size == 0
+bearSignal = bearCISD and htfBearOK and irlBearActive and smtBearOK and sessionOK and strategy.position_size == 0
+
+if bullSignal
+    sl   = swBullLow - slBuffer
+    risk = close - sl
     if risk > 0
-        tp = fill + risk * rr
+        obRange = swBullHigh - swBullLow
+        tpERL   = (useERLTarget and not na(lastLTPH) and lastLTPH > close) ? lastLTPH : na
+        tp      = na(tpERL) ? close + risk * rrFallback : tpERL
         strategy.entry("L", strategy.long)
-        strategy.exit("L-x", "L", stop = entrySL, limit = tp)
-    setupDir := 0
-    entryTop := na
-    entryBot := na
+        strategy.exit("L-x", "L", stop = sl, limit = tp)
+        if showOB
+            box.new(left = bar_index - sweeperBullIdx, top = swBullHigh,
+                 right = bar_index + 12, bottom = swBullLow,
+                 bgcolor = color.new(color.teal, 78), border_color = color.new(color.teal, 40))
+        // reset IRL window after firing
+        irlBullTagBar := na
 
-if shortSignal
-    fill = close
-    risk = entrySL - fill
+if bearSignal
+    sl   = swBearHigh + slBuffer
+    risk = sl - close
     if risk > 0
-        tp = fill - risk * rr
+        obRange = swBearHigh - swBearLow
+        tpERL   = (useERLTarget and not na(lastLTPL) and lastLTPL < close) ? lastLTPL : na
+        tp      = na(tpERL) ? close - risk * rrFallback : tpERL
         strategy.entry("S", strategy.short)
-        strategy.exit("S-x", "S", stop = entrySL, limit = tp)
-    setupDir := 0
-    entryTop := na
-    entryBot := na
+        strategy.exit("S-x", "S", stop = sl, limit = tp)
+        if showOB
+            box.new(left = bar_index - sweeperBearIdx, top = swBearHigh,
+                 right = bar_index + 12, bottom = swBearLow,
+                 bgcolor = color.new(color.maroon, 78), border_color = color.new(color.maroon, 40))
+        irlBearTagBar := na
 
 // ============================================================================
-//  VISUALS
+//  LTF FVG visuals (for context only — not a trade trigger here)
 // ============================================================================
-bgcolor(showHTFZone and htfBias ==  1 ? color.new(color.green, 92) :
-        showHTFZone and htfBias == -1 ? color.new(color.red,   92) : na,
-        title = "HTF Bias")
+ltfBullFVG = low > high[2]
+ltfBearFVG = high < low[2]
+if showLTFFVG and ltfBullFVG
+    box.new(left = bar_index - 2, top = low, right = bar_index + 6, bottom = high[2],
+         bgcolor = color.new(color.green, 86), border_color = color.new(color.green, 60))
+if showLTFFVG and ltfBearFVG
+    box.new(left = bar_index - 2, top = low[2], right = bar_index + 6, bottom = high,
+         bgcolor = color.new(color.red, 86), border_color = color.new(color.red, 60))
 
-plotshape(showSignals and sweepLow,  "Sweep Low",  shape.triangleup,   location.belowbar, color.new(color.aqua,   0), size = size.tiny)
-plotshape(showSignals and sweepHigh, "Sweep High", shape.triangledown, location.abovebar, color.new(color.orange, 0), size = size.tiny)
-plotshape(showSignals and bullCHoCH, "Bull CHoCH", shape.labelup,      location.belowbar, color.new(color.green,  0), text = "CHoCH", textcolor = color.white, size = size.tiny)
-plotshape(showSignals and bearCHoCH, "Bear CHoCH", shape.labeldown,    location.abovebar, color.new(color.red,    0), text = "CHoCH", textcolor = color.white, size = size.tiny)
+// ============================================================================
+//  HTF FVG / CE / signal markers
+// ============================================================================
+plot(showHTFFVG and not na(htfBullTop) ? htfBullTop : na, "HTF Bull FVG top", color.new(color.green, 30), style = plot.style_linebr)
+plot(showHTFFVG and not na(htfBullBot) ? htfBullBot : na, "HTF Bull FVG bot", color.new(color.green, 30), style = plot.style_linebr)
+plot(showHTFFVG and not na(htfBearTop) ? htfBearTop : na, "HTF Bear FVG top", color.new(color.red,   30), style = plot.style_linebr)
+plot(showHTFFVG and not na(htfBearBot) ? htfBearBot : na, "HTF Bear FVG bot", color.new(color.red,   30), style = plot.style_linebr)
+plot(showCE and not na(bullCE) ? bullCE : na, "Bull CE", color.new(color.green, 50), style = plot.style_circles)
+plot(showCE and not na(bearCE) ? bearCE : na, "Bear CE", color.new(color.red,   50), style = plot.style_circles)
 
-if showFVG and bullFVG
-    box.new(left = bar_index - 2, top = bullFVGTop, right = bar_index + 8, bottom = bullFVGBot,
-         bgcolor = color.new(color.green, 82), border_color = color.new(color.green, 55))
-if showFVG and bearFVG
-    box.new(left = bar_index - 2, top = bearFVGTop, right = bar_index + 8, bottom = bearFVGBot,
-         bgcolor = color.new(color.red, 82), border_color = color.new(color.red, 55))
+plotshape(showSignals and irlBullTag, "IRL Bull Tag", shape.diamond,   location.belowbar, color.new(color.lime,   0), size = size.tiny)
+plotshape(showSignals and irlBearTag, "IRL Bear Tag", shape.diamond,   location.abovebar, color.new(color.fuchsia,0), size = size.tiny)
+plotshape(showSignals and bullCISD,   "Bull CISD",    shape.labelup,   location.belowbar, color.new(color.green,  0), text = "CISD", textcolor = color.white, size = size.tiny)
+plotshape(showSignals and bearCISD,   "Bear CISD",    shape.labeldown, location.abovebar, color.new(color.red,    0), text = "CISD", textcolor = color.white, size = size.tiny)
 
-// dashboard
-var table info = table.new(position.top_right, 2, 4, border_width = 1)
-if barstate.islast
-    biasTxt = htfBias ==  1 ? "BULL" : htfBias == -1 ? "BEAR" : "NEUTRAL"
-    biasCol = htfBias ==  1 ? color.green : htfBias == -1 ? color.red : color.gray
-    setupTxt = setupDir ==  1 ? "LONG armed" : setupDir == -1 ? "SHORT armed" : "—"
-    table.cell(info, 0, 0, "HTF Bias",  bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 1, 0, biasTxt,     bgcolor = color.new(biasCol, 70),     text_color = color.white)
-    table.cell(info, 0, 1, "Sweep",     bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 1, 1, sweepDir == 1 ? "LOW swept" : sweepDir == -1 ? "HIGH swept" : "—",
-                                        bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 0, 2, "Setup",     bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 1, 2, setupTxt,    bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 0, 3, "Entry zone",bgcolor = color.new(color.black, 70), text_color = color.white)
-    table.cell(info, 1, 3, na(entryTop) ? "—" : str.tostring(entryBot, format.mintick) + " – " + str.tostring(entryTop, format.mintick),
-                                        bgcolor = color.new(color.black, 70), text_color = color.white)
+bgcolor(htfBias ==  1 ? color.new(color.green, 95) :
+        htfBias == -1 ? color.new(color.red,   95) : na, title = "HTF Bias")
+
+// ============================================================================
+//  ALERTS
+// ============================================================================
+alertcondition(irlBullTag, "IRL Bull Tag",  "Price tagged bullish HTF FVG (IRL)")
+alertcondition(irlBearTag, "IRL Bear Tag",  "Price tagged bearish HTF FVG (IRL)")
+alertcondition(bullCISD,   "Bull CISD",     "Bullish CISD confirmed")
+alertcondition(bearCISD,   "Bear CISD",     "Bearish CISD confirmed")
+alertcondition(bullSignal, "Long Entry",    "Forever-style long fired")
+alertcondition(bearSignal, "Short Entry",   "Forever-style short fired")
+
+// ============================================================================
+//  DASHBOARD
+// ============================================================================
+var table info = table.new(position.top_right, 2, 5, border_width = 1)
+if showTable and barstate.islast
+    biasTxt  = htfBias ==  1 ? "BULL" : htfBias == -1 ? "BEAR" : "—"
+    biasCol  = htfBias ==  1 ? color.green : htfBias == -1 ? color.red : color.gray
+    irlTxt   = irlBullActive and htfBias == 1 ? "Bull armed" : irlBearActive and htfBias == -1 ? "Bear armed" : "—"
+    sessTxt  = useSession ? (sessionOK ? "OPEN" : "closed") : "off"
+    table.cell(info, 0, 0, "HTF Bias",   bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 1, 0, biasTxt,      bgcolor = color.new(biasCol, 70),     text_color = color.white)
+    table.cell(info, 0, 1, "IRL",        bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 1, 1, irlTxt,       bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 0, 2, "Last STH",   bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 1, 2, na(lastSTH) ? "—" : str.tostring(lastSTH, format.mintick),
+                                         bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 0, 3, "Last STL",   bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 1, 3, na(lastSTL) ? "—" : str.tostring(lastSTL, format.mintick),
+                                         bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 0, 4, "Session",    bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 1, 4, sessTxt,      bgcolor = color.new(color.black, 70), text_color = color.white)
