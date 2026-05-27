@@ -1,19 +1,22 @@
 //@version=6
-// Forever-style SMC Sniper Strategy (v4)
+// Forever-style SMC Sniper Strategy (v5)
 //
-// Tightened to match the Forever Model [Pro+] visual workflow:
-//   - 3-state bias (Bullish / Bearish / Both)
-//   - CISD displacement filter to suppress noise
-//   - Only fully-confirmed models draw signal labels
-//   - OB box with N-multiple projection lines ("2", "3" by default)
-//   - ERL horizontal target line with label
-//   - Optional 2nd SMT pair
-//   - Optional invalidation 'x' marker when price breaks the SL extreme
-//   - HTF FVG (IRL) rendered as a single right-extending zone
-//   - No background shading
+// Aligned with the public Forever Model [Pro+] specification
+// (toodegrees.trade/indicators/Forever Model). Key fixes vs v4:
 //
-// This is an original implementation of the public concept list. It does
-// not include or reproduce the proprietary closed-source Pine.
+//   * CISD now matches the official definition: a single candle that
+//     sweeps a short-term high/low and closes beyond its own open. The
+//     Orderblock IS that CISD candle (not a prior sweeper).
+//   * SMT divergence is pivot-based on the correlated chart: our chart
+//     swept its STH/STL but the correlated chart did not sweep its own.
+//   * Bias options renamed to Forever's own terms: Bullish / Bearish /
+//     Neutral. Neutral allows both directions, gated by HTF alignment.
+//   * Visuals follow Forever's component list: HTF FVG (IRL) zone with
+//     CE midline, sweep marker, OB box, OB projections, ERL line, CISD
+//     label, invalidation 'x', dashboard, alerts.
+//
+// This is an original implementation of the publicly documented
+// concepts. It does not reproduce the proprietary closed-source Pine.
 
 strategy(
      title              = "Forever-style SMC Sniper",
@@ -36,7 +39,7 @@ strategy(
 //  INPUTS
 // ============================================================================
 gHTF = "1. HTF Bias (IRL source)"
-biasMode = input.string("Both", "Bias", options = ["Bullish", "Bearish", "Both"], group = gHTF)
+biasMode = input.string("Neutral", "Bias", options = ["Bullish", "Bearish", "Neutral"], group = gHTF)
 htf      = input.timeframe("D", "HTF for IRL FVG", group = gHTF)
 showCE   = input.bool(true, "Plot CE (FVG midline)", group = gHTF)
 
@@ -46,14 +49,13 @@ maxBarsIRLtoCISD = input.int(40,    "Max bars from IRL tag to CISD", minval = 3,
 
 gSTR = "3. CISD"
 sthLen       = input.int(3,    "Short-term pivot length (STH/STL)", minval = 1, group = gSTR)
-cisdLookback = input.int(5,    "Bars back to find sweeper",         minval = 1, group = gSTR)
-cisdMinDispl = input.float(1.2,"Min CISD body / ATR (displacement)", minval = 0, step = 0.1, group = gSTR)
+cisdMinDispl = input.float(0,  "Min CISD body / ATR (0 = off)", minval = 0, step = 0.1, group = gSTR)
 
 gERL = "4. ERL / OB Projections"
-ltLen          = input.int(10,  "Major pivot length (ERL)", minval = 3, group = gERL)
-useERLTarget   = input.bool(true,  "Target next ERL liquidity",          group = gERL)
-useOBProj      = input.bool(true,  "Show OB projection levels",          group = gERL)
-obProjMults    = input.string("2, 3", "OB projection multipliers (csv)", group = gERL)
+ltLen          = input.int(10,  "Major pivot length (ERL)",      minval = 3, group = gERL)
+useERLTarget   = input.bool(true,  "Target next ERL liquidity",           group = gERL)
+useOBProj      = input.bool(true,  "Show OB projection levels",           group = gERL)
+obProjMults    = input.string("2, 3", "OB projection multipliers (csv)",  group = gERL)
 rrFallback     = input.float(2.0, "RR fallback if no ERL ahead", minval = 0.5, step = 0.25, group = gERL)
 slBufferTicks  = input.int(2,   "SL buffer (ticks)", minval = 0, group = gERL)
 
@@ -80,6 +82,7 @@ showOutcomes     = input.bool(true,"Show W/L outcome labels",        group = gVI
 showHTFFVG       = input.bool(true,"Plot HTF FVG (IRL) zones",       group = gVIZ)
 showOB           = input.bool(true,"Plot Orderblock from CISD",      group = gVIZ)
 showERLLine      = input.bool(true,"Plot ERL target line",           group = gVIZ)
+showSweep        = input.bool(true,"Plot sweep marker",              group = gVIZ)
 showCISDLabel    = input.bool(true,"Plot CISD label on confirmation",group = gVIZ)
 showInvalidation = input.bool(true,"Plot invalidation 'x' marker",   group = gVIZ)
 showTable        = input.bool(true,"Dashboard table",                group = gVIZ)
@@ -173,36 +176,19 @@ if not na(stl)
     lastSTL := stl
 
 // ============================================================================
-//  CISD with displacement filter
+//  CISD  -  Forever's definition:
+//      a single candle that sweeps STH/STL and closes beyond its own open.
+//      The Orderblock IS this candle.
 // ============================================================================
-atrV = ta.atr(20)
-displOK = math.abs(close - open) >= cisdMinDispl * atrV
+atrV    = ta.atr(20)
+displOK = cisdMinDispl <= 0 or math.abs(close - open) >= cisdMinDispl * atrV
 
-int sweeperBullIdx = na
-int sweeperBearIdx = na
-if not na(lastSTL)
-    for i = 1 to cisdLookback
-        if low[i] < lastSTL and na(sweeperBullIdx)
-            sweeperBullIdx := i
-if not na(lastSTH)
-    for i = 1 to cisdLookback
-        if high[i] > lastSTH and na(sweeperBearIdx)
-            sweeperBearIdx := i
-
-float swBullOpen  = na(sweeperBullIdx) ? na : open[sweeperBullIdx]
-float swBullClose = na(sweeperBullIdx) ? na : close[sweeperBullIdx]
-float swBullHigh  = na(sweeperBullIdx) ? na : high[sweeperBullIdx]
-float swBullLow   = na(sweeperBullIdx) ? na : low[sweeperBullIdx]
-float swBearOpen  = na(sweeperBearIdx) ? na : open[sweeperBearIdx]
-float swBearClose = na(sweeperBearIdx) ? na : close[sweeperBearIdx]
-float swBearHigh  = na(sweeperBearIdx) ? na : high[sweeperBearIdx]
-float swBearLow   = na(sweeperBearIdx) ? na : low[sweeperBearIdx]
-
-bullCISD = not na(sweeperBullIdx) and close > open and close > math.max(swBullOpen, swBullClose) and displOK
-bearCISD = not na(sweeperBearIdx) and close < open and close < math.min(swBearOpen, swBearClose) and displOK
+bullCISD = not na(lastSTL) and low  < lastSTL and close > open and displOK
+bearCISD = not na(lastSTH) and high > lastSTH and close < open and displOK
 
 // ============================================================================
-//  SMT  (1st + optional 2nd pair)
+//  SMT  -  pivot-based divergence on the correlated chart
+//      Our chart swept its STL/STH; correlated did NOT sweep its own.
 // ============================================================================
 autoSmtPair() =>
     s     = syminfo.ticker
@@ -242,30 +228,40 @@ smtTargetSym  = useAutoSMT ? autoSmtPair() : smtSym
 [smtH,  smtL]  = request.security(smtTargetSym, timeframe.period, [high, low], lookahead = barmerge.lookahead_off)
 [smtH2, smtL2] = request.security(smtSym2,      timeframe.period, [high, low], lookahead = barmerge.lookahead_off)
 
-float smtSweepLo  = na(sweeperBullIdx) ? na : smtL[sweeperBullIdx]
-float smtSweepHi  = na(sweeperBearIdx) ? na : smtH[sweeperBearIdx]
-float smtPriorLo  = na(sweeperBullIdx) ? na : smtL[sweeperBullIdx + 1]
-float smtPriorHi  = na(sweeperBearIdx) ? na : smtH[sweeperBearIdx + 1]
-float smt2SweepLo = na(sweeperBullIdx) ? na : smtL2[sweeperBullIdx]
-float smt2SweepHi = na(sweeperBearIdx) ? na : smtH2[sweeperBearIdx]
-float smt2PriorLo = na(sweeperBullIdx) ? na : smtL2[sweeperBullIdx + 1]
-float smt2PriorHi = na(sweeperBearIdx) ? na : smtH2[sweeperBearIdx + 1]
+smtPH  = ta.pivothigh(smtH, sthLen, sthLen)
+smtPL  = ta.pivotlow(smtL,  sthLen, sthLen)
+smt2PH = ta.pivothigh(smtH2, sthLen, sthLen)
+smt2PL = ta.pivotlow(smtL2,  sthLen, sthLen)
+var float smtLastSTH = na
+var float smtLastSTL = na
+var float smt2LastSTH = na
+var float smt2LastSTL = na
+if not na(smtPH)
+    smtLastSTH := smtPH
+if not na(smtPL)
+    smtLastSTL := smtPL
+if not na(smt2PH)
+    smt2LastSTH := smt2PH
+if not na(smt2PL)
+    smt2LastSTL := smt2PL
 
-smtBullDirect  = not na(smtSweepLo)  and not na(smtPriorLo)  and smtSweepLo  >= smtPriorLo
-smtBearDirect  = not na(smtSweepHi)  and not na(smtPriorHi)  and smtSweepHi  <= smtPriorHi
-smt2BullDirect = not na(smt2SweepLo) and not na(smt2PriorLo) and smt2SweepLo >= smt2PriorLo
-smt2BearDirect = not na(smt2SweepHi) and not na(smt2PriorHi) and smt2SweepHi <= smt2PriorHi
+// Divergence rule: our chart swept, correlated did not.
+// For bullish CISD (our low < lastSTL): correlated's low must be >= its smtLastSTL.
+smt1BullDiv = na(smtLastSTL) or smtL >= smtLastSTL
+smt1BearDiv = na(smtLastSTH) or smtH <= smtLastSTH
+smt2BullDiv = na(smt2LastSTL) or smtL2 >= smt2LastSTL
+smt2BearDiv = na(smt2LastSTH) or smtH2 <= smt2LastSTH
 
-smt1BullOK = smtInverse  ? not smtBullDirect  : smtBullDirect
-smt1BearOK = smtInverse  ? not smtBearDirect  : smtBearDirect
-smt2BullOK = smt2Inverse ? not smt2BullDirect : smt2BullDirect
-smt2BearOK = smt2Inverse ? not smt2BearDirect : smt2BearDirect
+smt1BullOK = smtInverse  ? not smt1BullDiv : smt1BullDiv
+smt1BearOK = smtInverse  ? not smt1BearDiv : smt1BearDiv
+smt2BullOK = smt2Inverse ? not smt2BullDiv : smt2BullDiv
+smt2BearOK = smt2Inverse ? not smt2BearDiv : smt2BearDiv
 
 smtBullOK = not useSMT or (use2ndSMT ? (smt1BullOK or smt2BullOK) : smt1BullOK)
 smtBearOK = not useSMT or (use2ndSMT ? (smt1BearOK or smt2BearOK) : smt1BearOK)
 
 // ============================================================================
-//  ERL  -  next major swing liquidity
+//  ERL  -  next major swing liquidity beyond internal structure
 // ============================================================================
 ltPH = ta.pivothigh(high, ltLen, ltLen)
 ltPL = ta.pivotlow(low,  ltLen, ltLen)
@@ -283,21 +279,20 @@ inSess(s) => not na(time(timeframe.period, s, sessTZ))
 sessionOK = not useSession or inSess(sess1) or inSess(sess2) or inSess(sess3) or inSess(sess4)
 
 // ============================================================================
-//  BIAS gate
-//      "Both"     -> require HTF bias to match signal direction
-//      "Bullish"  -> only long signals, HTF bias not required
-//      "Bearish"  -> only short signals, HTF bias not required
+//  BIAS gate (Forever terms)
+//      Neutral  -> show both directions, each gated by HTF alignment
+//      Bullish  -> only long formations, HTF alignment skipped
+//      Bearish  -> only short formations, HTF alignment skipped
 // ============================================================================
-bullDirOK = biasMode == "Bullish" or (biasMode == "Both" and htfBias ==  1)
-bearDirOK = biasMode == "Bearish" or (biasMode == "Both" and htfBias == -1)
+bullDirOK = (biasMode == "Bullish") or (biasMode == "Neutral" and htfBias ==  1)
+bearDirOK = (biasMode == "Bearish") or (biasMode == "Neutral" and htfBias == -1)
 
 bullSignal = bullCISD and bullDirOK and irlBullActive and smtBullOK and sessionOK and strategy.position_size == 0
 bearSignal = bearCISD and bearDirOK and irlBearActive and smtBearOK and sessionOK and strategy.position_size == 0
 
 // ============================================================================
-//  MODEL drawing  -  OB box + projection lines + ERL line + CISD label
-//      Tracked per-direction so we can mark invalidation later.
-//      Ring buffer evicts the oldest formation past maxModels.
+//  MODEL drawing  -  OB box (the CISD candle itself) + projections + ERL +
+//                    sweep marker + CISD label.
 // ============================================================================
 type Model
     int   bar
@@ -307,6 +302,8 @@ type Model
     float sl
     box   obBox
     label cisdLbl
+    line  sweepLine
+    label sweepLbl
     line  erlLine
     label erlLbl
     array<line>  projLines
@@ -316,23 +313,26 @@ type Model
 
 var array<Model> models = array.new<Model>()
 
-drawModel(int dir, int swIdx, float obH, float obL, float sl) =>
+drawModel(int dir, float obH, float obL, float sl, float sweepLvl) =>
     m = Model.new(bar = bar_index, dir = dir, obHigh = obH, obLow = obL, sl = sl, invalidated = false, projLines = array.new<line>(), projLbls = array.new<label>())
     if showOB
         bg = dir == 1 ? color.new(color.teal, 78) : color.new(color.maroon, 78)
         bd = dir == 1 ? color.new(color.teal, 30) : color.new(color.maroon, 30)
-        m.obBox := box.new(left = bar_index - swIdx, top = obH, right = bar_index + 15, bottom = obL, bgcolor = bg, border_color = bd)
+        m.obBox := box.new(left = bar_index, top = obH, right = bar_index + 15, bottom = obL, bgcolor = bg, border_color = bd)
     if showCISDLabel
         col = dir == 1 ? color.new(color.green, 0) : color.new(color.red, 0)
         sty = dir == 1 ? label.style_label_up : label.style_label_down
         ypx = dir == 1 ? low : high
         m.cisdLbl := label.new(bar_index, ypx, text = "CISD", style = sty, color = col, textcolor = color.white, size = size.small)
+    if showSweep and not na(sweepLvl)
+        m.sweepLine := line.new(bar_index - 4, sweepLvl, bar_index + 2, sweepLvl, color = color.new(color.orange, 0), style = line.style_dotted, width = 1)
+        m.sweepLbl  := label.new(bar_index + 2, sweepLvl, text = "✕", style = label.style_none, textcolor = color.new(color.orange, 0), size = size.tiny)
     body = obH - obL
     if useOBProj and body > 0 and array.size(projMults) > 0
         for j = 0 to array.size(projMults) - 1
             mult  = array.get(projMults, j)
             level = dir == 1 ? obH + body * mult : obL - body * mult
-            pl = line.new(bar_index + 2, level, bar_index + 22, level, color = color.new(color.red, 0), width = 1, style = line.style_solid)
+            pl  = line.new(bar_index + 2, level, bar_index + 22, level, color = color.new(color.red, 0), width = 1, style = line.style_solid)
             tag = (dir == 1 ? "" : "-") + str.tostring(mult, format.mintick)
             pll = label.new(bar_index + 22, level, text = tag, style = label.style_none, textcolor = color.red, size = size.small)
             array.push(m.projLines, pl)
@@ -348,6 +348,10 @@ drawModel(int dir, int swIdx, float obH, float obL, float sl) =>
             box.delete(old.obBox)
         if not na(old.cisdLbl)
             label.delete(old.cisdLbl)
+        if not na(old.sweepLine)
+            line.delete(old.sweepLine)
+        if not na(old.sweepLbl)
+            label.delete(old.sweepLbl)
         if not na(old.erlLine)
             line.delete(old.erlLine)
         if not na(old.erlLbl)
@@ -362,13 +366,13 @@ drawModel(int dir, int swIdx, float obH, float obL, float sl) =>
                 label.delete(array.get(old.projLbls, k))
 
 // ============================================================================
-//  INVALIDATION  -  mark active models whose SL got hit
+//  INVALIDATION  -  close beyond the OB extreme in the wrong direction
 // ============================================================================
 if array.size(models) > 0
     for j = 0 to array.size(models) - 1
         mm = array.get(models, j)
         if not mm.invalidated
-            broken = (mm.dir == 1 and low < mm.sl) or (mm.dir == -1 and high > mm.sl)
+            broken = (mm.dir == 1 and close < mm.obLow) or (mm.dir == -1 and close > mm.obHigh)
             if broken
                 mm.invalidated := true
                 if not na(mm.obBox)
@@ -380,27 +384,28 @@ if array.size(models) > 0
 
 // ============================================================================
 //  ENTRY orders
+//      OB = CISD candle itself; SL = OB extreme +/- buffer.
 // ============================================================================
 if bullSignal
-    sl   = swBullLow - slBuffer
+    sl   = low - slBuffer
     risk = close - sl
     if risk > 0
         tpERL = (useERLTarget and not na(lastLTPH) and lastLTPH > close) ? lastLTPH : na
         tp    = na(tpERL) ? close + risk * rrFallback : tpERL
         strategy.entry("L", strategy.long)
         strategy.exit("L-x", "L", stop = sl, limit = tp)
-        drawModel(1, sweeperBullIdx, swBullHigh, swBullLow, sl)
+        drawModel(1, high, low, sl, lastSTL)
         irlBullTagBar := na
 
 if bearSignal
-    sl   = swBearHigh + slBuffer
+    sl   = high + slBuffer
     risk = sl - close
     if risk > 0
         tpERL = (useERLTarget and not na(lastLTPL) and lastLTPL < close) ? lastLTPL : na
         tp    = na(tpERL) ? close - risk * rrFallback : tpERL
         strategy.entry("S", strategy.short)
         strategy.exit("S-x", "S", stop = sl, limit = tp)
-        drawModel(-1, sweeperBearIdx, swBearHigh, swBearLow, sl)
+        drawModel(-1, high, low, sl, lastSTH)
         irlBearTagBar := na
 
 // ============================================================================
@@ -417,10 +422,14 @@ if showOutcomes and strategy.closedtrades > lastClosed
     lastClosed := strategy.closedtrades
 
 // ============================================================================
-//  ALERTS
+//  ALERTS  (named after Forever's documented alert categories)
 // ============================================================================
-alertcondition(bullSignal, "Forever Long",  "Forever-style long fired")
-alertcondition(bearSignal, "Forever Short", "Forever-style short fired")
+alertcondition(irlBullTag, "Internal Range Tag (Bull)", "Bullish IRL tagged")
+alertcondition(irlBearTag, "Internal Range Tag (Bear)", "Bearish IRL tagged")
+alertcondition(bullCISD,   "CISD (Bull)",  "Bullish CISD detected")
+alertcondition(bearCISD,   "CISD (Bear)",  "Bearish CISD detected")
+alertcondition(bullSignal, "Model Activated (Bull)", "Bullish Forever model activated")
+alertcondition(bearSignal, "Model Activated (Bear)", "Bearish Forever model activated")
 
 // ============================================================================
 //  DASHBOARD
