@@ -1,4 +1,4 @@
-//@version=5
+//@version=6
 // Forever-style SMC Sniper Strategy (v2)
 //
 // Implements the publicly described three-part Forever Model workflow:
@@ -28,6 +28,7 @@ strategy(
      pyramiding         = 0,
      calc_on_every_tick = false,
      process_orders_on_close = true,
+     dynamic_requests   = true,
      max_boxes_count    = 500,
      max_lines_count    = 500,
      max_labels_count   = 500)
@@ -158,10 +159,8 @@ float swBearHigh  = na(sweeperBearIdx) ? na : high[sweeperBearIdx]
 float swBearLow   = na(sweeperBearIdx) ? na : low[sweeperBearIdx]
 
 // Bullish CISD: current bar green, close engulfs the sweeper's body upward
-bullCISD = not na(sweeperBullIdx) and close > open and
-           close > math.max(swBullOpen, swBullClose)
-bearCISD = not na(sweeperBearIdx) and close < open and
-           close < math.min(swBearOpen, swBearClose)
+bullCISD = not na(sweeperBullIdx) and close > open and close > math.max(swBullOpen, swBullClose)
+bearCISD = not na(sweeperBearIdx) and close < open and close < math.min(swBearOpen, swBearClose)
 
 // ============================================================================
 //  SMT DIVERGENCE  -  correlated asset failed to make the same sweep
@@ -174,22 +173,34 @@ autoSmtPair() =>
     base  = syminfo.basecurrency
     quote = syminfo.currency
     typ   = syminfo.type
-    fut = s == "ES1!" or str.startswith(s, "ES1") ? "CME_MINI:NQ1!" :
-          s == "NQ1!" or str.startswith(s, "NQ1") ? "CME_MINI:ES1!" :
-          s == "YM1!" ? "CME_MINI:ES1!" :
-          s == "RTY1!" ? "CME_MINI:ES1!" : na
-    fx  = typ == "forex" ?
-          (base == "EUR" and quote == "USD" ? "OANDA:GBPUSD" :
-           base == "GBP" and quote == "USD" ? "OANDA:EURUSD" :
-           base == "AUD" and quote == "USD" ? "OANDA:NZDUSD" :
-           base == "NZD" and quote == "USD" ? "OANDA:AUDUSD" :
-           base == "USD" and quote == "JPY" ? "OANDA:USDCHF" :
-           base == "USD" and quote == "CHF" ? "OANDA:USDJPY" : na) : na
-    met = str.contains(s, "XAU") or str.contains(s, "GOLD")   ? "TVC:SILVER" :
-          str.contains(s, "XAG") or str.contains(s, "SILVER") ? "TVC:GOLD"   : na
-    cry = str.contains(s, "BTC") ? "BINANCE:ETHUSDT" :
-          str.contains(s, "ETH") ? "BINANCE:BTCUSDT" : na
-    not na(fut) ? fut : not na(fx) ? fx : not na(met) ? met : not na(cry) ? cry : smtSym
+    string result = smtSym
+    if s == "ES1!" or str.startswith(s, "ES1")
+        result := "CME_MINI:NQ1!"
+    else if s == "NQ1!" or str.startswith(s, "NQ1")
+        result := "CME_MINI:ES1!"
+    else if s == "YM1!" or s == "RTY1!"
+        result := "CME_MINI:ES1!"
+    else if typ == "forex" and base == "EUR" and quote == "USD"
+        result := "OANDA:GBPUSD"
+    else if typ == "forex" and base == "GBP" and quote == "USD"
+        result := "OANDA:EURUSD"
+    else if typ == "forex" and base == "AUD" and quote == "USD"
+        result := "OANDA:NZDUSD"
+    else if typ == "forex" and base == "NZD" and quote == "USD"
+        result := "OANDA:AUDUSD"
+    else if typ == "forex" and base == "USD" and quote == "JPY"
+        result := "OANDA:USDCHF"
+    else if typ == "forex" and base == "USD" and quote == "CHF"
+        result := "OANDA:USDJPY"
+    else if str.contains(s, "XAU") or str.contains(s, "GOLD")
+        result := "TVC:SILVER"
+    else if str.contains(s, "XAG") or str.contains(s, "SILVER")
+        result := "TVC:GOLD"
+    else if str.contains(s, "BTC")
+        result := "BINANCE:ETHUSDT"
+    else if str.contains(s, "ETH")
+        result := "BINANCE:BTCUSDT"
+    result
 
 smtTargetSym = useAutoSMT ? autoSmtPair() : smtSym
 [smtH, smtL] = request.security(smtTargetSym, timeframe.period, [high, low],
@@ -233,7 +244,7 @@ htfBearOK = not useHTFBias or htfBias == -1
 bullSignal = bullCISD and htfBullOK and irlBullActive and smtBullOK and sessionOK and strategy.position_size == 0
 bearSignal = bearCISD and htfBearOK and irlBearActive and smtBearOK and sessionOK and strategy.position_size == 0
 
-var box[] obBoxes = array.new_box()
+var array<box> obBoxes = array.new<box>()
 
 if bullSignal
     sl   = swBullLow - slBuffer
@@ -314,8 +325,8 @@ plotshape(showSignals and irlBearTag, "IRL Bear Tag", shape.diamond,   location.
 plotshape(showSignals and bullCISD,   "Bull CISD",    shape.labelup,   location.belowbar, color.new(color.green,  0), text = "CISD", textcolor = color.white, size = size.tiny)
 plotshape(showSignals and bearCISD,   "Bear CISD",    shape.labeldown, location.abovebar, color.new(color.red,    0), text = "CISD", textcolor = color.white, size = size.tiny)
 
-bgcolor(htfBias ==  1 ? color.new(color.green, 95) :
-        htfBias == -1 ? color.new(color.red,   95) : na, title = "HTF Bias")
+biasBg = htfBias == 1 ? color.new(color.green, 95) : htfBias == -1 ? color.new(color.red, 95) : na
+bgcolor(biasBg, title = "HTF Bias")
 
 // ============================================================================
 //  ALERTS
