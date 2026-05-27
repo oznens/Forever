@@ -1,0 +1,276 @@
+//@version=5
+// Forever-style SMC Sniper Strategy
+// Inspired by the public SMC/ICT workflow:
+//   1. HTF bias from the latest Higher-Timeframe Fair Value Gap
+//   2. Liquidity sweep of a swing pivot on the trading TF
+//   3. Market Structure Shift (CHoCH) in the opposite direction
+//   4. Entry on the first Fair Value Gap that forms inside the CHoCH leg
+//   5. Stop beyond the swept liquidity, target at an R-multiple
+//   6. Optional SMT divergence filter against a correlated symbol
+//
+// This is an original implementation of the published SMC concepts; it is not
+// a reproduction of any proprietary closed-source indicator.
+
+strategy(
+     title              = "Forever-style SMC Sniper",
+     shorttitle         = "SMC Sniper",
+     overlay            = true,
+     initial_capital    = 10000,
+     default_qty_type   = strategy.percent_of_equity,
+     default_qty_value  = 10,
+     commission_type    = strategy.commission.percent,
+     commission_value   = 0.04,
+     pyramiding         = 0,
+     calc_on_every_tick = false,
+     process_orders_on_close = true,
+     max_boxes_count    = 500,
+     max_lines_count    = 500,
+     max_labels_count   = 500)
+
+// ============================================================================
+//  INPUTS
+// ============================================================================
+gHTF   = "Higher Timeframe Bias"
+htf            = input.timeframe("240", "HTF",                                      group = gHTF)
+useHTFBias     = input.bool(true,        "Require HTF FVG bias alignment",          group = gHTF)
+
+gStruct = "Structure / Sweep"
+swingLen       = input.int(5,            "Swing pivot length (liquidity)",  minval=2, group = gStruct)
+maxBarsToCHoCH = input.int(30,           "Max bars from sweep to CHoCH",    minval=2, group = gStruct)
+maxBarsToEntry = input.int(25,           "Max bars from CHoCH to entry",    minval=2, group = gStruct)
+
+gRisk = "Risk Management"
+rr             = input.float(2.0,        "Risk : Reward target",            minval=0.5, step=0.25, group = gRisk)
+slBufferTicks  = input.int(2,            "SL buffer (ticks beyond sweep)",  minval=0, group = gRisk)
+
+gSMT = "SMT Divergence (optional)"
+useSMT         = input.bool(false,       "Use SMT divergence filter",               group = gSMT)
+smtSym         = input.symbol("CAPITALCOM:US100", "Correlated symbol",              group = gSMT)
+
+gViz = "Visuals"
+showFVG        = input.bool(true,        "Plot LTF Fair Value Gaps",                group = gViz)
+showHTFZone    = input.bool(true,        "Highlight HTF bias on background",        group = gViz)
+showSignals    = input.bool(true,        "Plot sweep / CHoCH markers",              group = gViz)
+
+slBuffer = slBufferTicks * syminfo.mintick
+
+// ============================================================================
+//  HTF FAIR VALUE GAP -> BIAS
+//      Bullish HTF FVG : low[1]  > high[3]
+//      Bearish HTF FVG : high[1] < low[3]
+// ============================================================================
+[htfH1, htfL1, htfH3, htfL3] = request.security(
+     syminfo.tickerid, htf, [high[1], low[1], high[3], low[3]],
+     lookahead = barmerge.lookahead_off)
+
+htfBullFVG = htfL1 > htfH3
+htfBearFVG = htfH1 < htfL3
+
+var int htfBias = 0
+if htfBullFVG
+    htfBias := 1
+if htfBearFVG
+    htfBias := -1
+
+// ============================================================================
+//  SWING PIVOTS = LIQUIDITY POOLS
+// ============================================================================
+ph = ta.pivothigh(high, swingLen, swingLen)
+pl = ta.pivotlow(low,  swingLen, swingLen)
+
+var float lastPH = na
+var float lastPL = na
+if not na(ph)
+    lastPH := ph
+if not na(pl)
+    lastPL := pl
+
+// ============================================================================
+//  LIQUIDITY SWEEP
+//      Bullish setup : wick takes lastPL, body closes back above
+//      Bearish setup : wick takes lastPH, body closes back below
+// ============================================================================
+sweepLow  = not na(lastPL) and low  < lastPL and close > lastPL
+sweepHigh = not na(lastPH) and high > lastPH and close < lastPH
+
+// ============================================================================
+//  CHoCH / MSS  state machine
+// ============================================================================
+var int   sweepDir     = 0          // +1 bull setup pending, -1 bear setup pending
+var int   sweepBar     = na
+var float sweepExtreme = na         // wick low (bull) / wick high (bear)
+
+if sweepLow
+    sweepDir     := 1
+    sweepBar     := bar_index
+    sweepExtreme := low
+if sweepHigh
+    sweepDir     := -1
+    sweepBar     := bar_index
+    sweepExtreme := high
+
+// time-out the pending sweep if no CHoCH within window
+if sweepDir != 0 and bar_index - sweepBar > maxBarsToCHoCH
+    sweepDir := 0
+
+// Use a 1-bar minor pivot as the level whose break = CHoCH
+minorPH = ta.pivothigh(high, 1, 1)
+minorPL = ta.pivotlow(low,  1, 1)
+
+var float bullCHoCHLvl = na
+var float bearCHoCHLvl = na
+
+if sweepDir == 1 and not na(minorPH)
+    bullCHoCHLvl := minorPH
+if sweepDir == -1 and not na(minorPL)
+    bearCHoCHLvl := minorPL
+
+bullCHoCH = sweepDir == 1 and not na(bullCHoCHLvl) and close > bullCHoCHLvl
+bearCHoCH = sweepDir == -1 and not na(bearCHoCHLvl) and close < bearCHoCHLvl
+
+// ============================================================================
+//  LTF FAIR VALUE GAPS (entry zones)
+// ============================================================================
+bullFVG    = low > high[2]
+bearFVG    = high < low[2]
+bullFVGTop = low
+bullFVGBot = high[2]
+bearFVGTop = low[2]
+bearFVGBot = high
+
+// ============================================================================
+//  ENTRY ZONE state machine
+// ============================================================================
+var int   setupDir = 0
+var int   chochBar = na
+var float entryTop = na
+var float entryBot = na
+var float entrySL  = na
+
+if bullCHoCH
+    setupDir       := 1
+    chochBar       := bar_index
+    entryTop       := na
+    entryBot       := na
+    entrySL        := sweepExtreme - slBuffer
+    sweepDir       := 0
+    bullCHoCHLvl   := na
+if bearCHoCH
+    setupDir       := -1
+    chochBar       := bar_index
+    entryTop       := na
+    entryBot       := na
+    entrySL        := sweepExtreme + slBuffer
+    sweepDir       := 0
+    bearCHoCHLvl   := na
+
+// capture the first FVG inside the CHoCH leg, in the setup direction
+if setupDir == 1 and bullFVG and na(entryTop)
+    entryTop := bullFVGTop
+    entryBot := bullFVGBot
+if setupDir == -1 and bearFVG and na(entryTop)
+    entryTop := bearFVGTop
+    entryBot := bearFVGBot
+
+// abandon setup if no fill within window
+if setupDir != 0 and bar_index - chochBar > maxBarsToEntry and strategy.position_size == 0
+    setupDir := 0
+    entryTop := na
+    entryBot := na
+    entrySL  := na
+
+// ============================================================================
+//  SMT DIVERGENCE FILTER  (optional)
+//      We sweep a low; correlated asset DOES NOT sweep its low  -> bullish SMT
+//      We sweep a high; correlated asset DOES NOT sweep its high -> bearish SMT
+// ============================================================================
+[smtH, smtL] = request.security(
+     smtSym, timeframe.period, [high, low],
+     lookahead = barmerge.lookahead_off)
+
+var float smtPriorL = na
+var float smtPriorH = na
+if not na(pl)
+    smtPriorL := smtL
+if not na(ph)
+    smtPriorH := smtH
+
+smtBull = not useSMT or (sweepLow  and not na(smtPriorL) and smtL >= smtPriorL)
+smtBear = not useSMT or (sweepHigh and not na(smtPriorH) and smtH <= smtPriorH)
+
+var bool smtOkBull = not useSMT
+var bool smtOkBear = not useSMT
+if sweepLow
+    smtOkBull := smtBull
+if sweepHigh
+    smtOkBear := smtBear
+
+// ============================================================================
+//  ENTRIES
+// ============================================================================
+htfOkBull = not useHTFBias or htfBias ==  1
+htfOkBear = not useHTFBias or htfBias == -1
+
+longTouch  = setupDir ==  1 and not na(entryTop) and low  <= entryTop
+shortTouch = setupDir == -1 and not na(entryBot) and high >= entryBot
+
+longSignal  = longTouch  and htfOkBull and smtOkBull and strategy.position_size == 0
+shortSignal = shortTouch and htfOkBear and smtOkBear and strategy.position_size == 0
+
+if longSignal
+    fill = close
+    risk = fill - entrySL
+    if risk > 0
+        tp = fill + risk * rr
+        strategy.entry("L", strategy.long)
+        strategy.exit("L-x", "L", stop = entrySL, limit = tp)
+    setupDir := 0
+    entryTop := na
+    entryBot := na
+
+if shortSignal
+    fill = close
+    risk = entrySL - fill
+    if risk > 0
+        tp = fill - risk * rr
+        strategy.entry("S", strategy.short)
+        strategy.exit("S-x", "S", stop = entrySL, limit = tp)
+    setupDir := 0
+    entryTop := na
+    entryBot := na
+
+// ============================================================================
+//  VISUALS
+// ============================================================================
+bgcolor(showHTFZone and htfBias ==  1 ? color.new(color.green, 92) :
+        showHTFZone and htfBias == -1 ? color.new(color.red,   92) : na,
+        title = "HTF Bias")
+
+plotshape(showSignals and sweepLow,  "Sweep Low",  shape.triangleup,   location.belowbar, color.new(color.aqua,   0), size = size.tiny)
+plotshape(showSignals and sweepHigh, "Sweep High", shape.triangledown, location.abovebar, color.new(color.orange, 0), size = size.tiny)
+plotshape(showSignals and bullCHoCH, "Bull CHoCH", shape.labelup,      location.belowbar, color.new(color.green,  0), text = "CHoCH", textcolor = color.white, size = size.tiny)
+plotshape(showSignals and bearCHoCH, "Bear CHoCH", shape.labeldown,    location.abovebar, color.new(color.red,    0), text = "CHoCH", textcolor = color.white, size = size.tiny)
+
+if showFVG and bullFVG
+    box.new(left = bar_index - 2, top = bullFVGTop, right = bar_index + 8, bottom = bullFVGBot,
+         bgcolor = color.new(color.green, 82), border_color = color.new(color.green, 55))
+if showFVG and bearFVG
+    box.new(left = bar_index - 2, top = bearFVGTop, right = bar_index + 8, bottom = bearFVGBot,
+         bgcolor = color.new(color.red, 82), border_color = color.new(color.red, 55))
+
+// dashboard
+var table info = table.new(position.top_right, 2, 4, border_width = 1)
+if barstate.islast
+    biasTxt = htfBias ==  1 ? "BULL" : htfBias == -1 ? "BEAR" : "NEUTRAL"
+    biasCol = htfBias ==  1 ? color.green : htfBias == -1 ? color.red : color.gray
+    setupTxt = setupDir ==  1 ? "LONG armed" : setupDir == -1 ? "SHORT armed" : "—"
+    table.cell(info, 0, 0, "HTF Bias",  bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 1, 0, biasTxt,     bgcolor = color.new(biasCol, 70),     text_color = color.white)
+    table.cell(info, 0, 1, "Sweep",     bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 1, 1, sweepDir == 1 ? "LOW swept" : sweepDir == -1 ? "HIGH swept" : "—",
+                                        bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 0, 2, "Setup",     bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 1, 2, setupTxt,    bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 0, 3, "Entry zone",bgcolor = color.new(color.black, 70), text_color = color.white)
+    table.cell(info, 1, 3, na(entryTop) ? "—" : str.tostring(entryBot, format.mintick) + " – " + str.tostring(entryTop, format.mintick),
+                                        bgcolor = color.new(color.black, 70), text_color = color.white)
